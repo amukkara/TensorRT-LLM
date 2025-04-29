@@ -430,7 +430,8 @@ def main(args):
 
     logger.info(f"Using {'Python' if args.use_py_session else 'C++'} session")
 
-    if args.draft_target_model_config is not None or args.prompt_lookup_config is not None:
+    is_run_dtlm_pld = args.draft_target_model_config is not None or args.prompt_lookup_config is not None
+    if is_run_dtlm_pld:
         # Speculative-Decoding of Draft-Target-Model (DTM) and Prompt-Lookup-Decoding (PLD)
         # If the parameters of `runner_kwargs` and `runner.generate()` in the "else" branch change, the same change should be done for `examples/prompt_lookup/run_dtm_pld.py`
         assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
@@ -440,7 +441,7 @@ def main(args):
 
         outputs = run_dtm_pld(batch_input_ids, args, runtime_rank, end_id,
                               pad_id, stop_words_list, bad_words_list,
-                              tokenizer.vocab_size)
+                              len(tokenizer))
         if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
             outputs, runner = list(outputs)[0]
 
@@ -606,7 +607,7 @@ def main(args):
                          output_log_probs_npy=args.output_log_probs_npy)
 
     # Profiling
-    if args.run_profiling:
+    if args.run_profiling and not is_run_dtlm_pld:
         ite = 10
         # warmup
         for _ in range(ite):

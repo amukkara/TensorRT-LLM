@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import ast
+import time
 
 import numpy as np
 import torch
@@ -130,22 +131,14 @@ def run_dtm_pld(batch_input_ids,
         use_logits = False  # `logits` is useless in this approach yet
 
     # Variables keeping constant during decoding
+    prompt_repeats = 1
+    batch_input_ids = batch_input_ids * prompt_repeats
     input_batch_size = len(batch_input_ids)  # Note as `BS`
     beam_width = args.num_beams  # Note as `BW`
-    is_compute_acceptance_ratio = logger.level == 'verbose'  # Only for verbose
+    is_compute_acceptance_ratio = True  #logger.level == 'verbose'  # Only for verbose
     input_len = [len(p) for p in batch_input_ids]
+    print(f"{input_len=}")
     max_seq_len = [i + args.max_output_len for i in input_len]
-    # Variables changing during decoding
-    n_iteration = 0
-    prefix = batch_input_ids  # Input for each iteration
-    batch_slot = list(range(input_batch_size))  # Index of requests
-    if is_compute_acceptance_ratio:
-        n_draft_token = [0 for _ in range(input_batch_size)]
-        n_accept_token = [0 for _ in range(input_batch_size)]
-
-    if is_pld:
-        pld_pool = PLDPool(input_batch_size, prompt_lookup_num_tokens,
-                           max_matching_ngram_size, end_id, max_seq_len)
 
     # Repack the output like the output of function `generate`
     outputs = {}
@@ -194,19 +187,20 @@ def run_dtm_pld(batch_input_ids,
         is_orchestrator_mode=True,
     )
 
-    if is_dtm:
-        draft_runner_kwargs = common_runner_kwargs.copy()
-        draft_runner_kwargs.update(engine_dir=args.draft_engine_dir,
-                                   device_ids=draft_device_list)
-        draft_runner = ModelRunnerCpp.from_dir(**draft_runner_kwargs)
-
     if target_runner is None:  # Skip this constructor if we have prepared the runner before
         target_runner_kwargs = common_runner_kwargs.copy()
         target_runner_kwargs.update(engine_dir=args.engine_dir,
                                     device_ids=target_device_list)
         target_runner = ModelRunnerCpp.from_dir(**target_runner_kwargs)
 
-    if is_dtm and (not use_logits) and \
+    if is_dtm:
+        draft_runner_kwargs = common_runner_kwargs.copy()
+        draft_runner_kwargs.update(engine_dir=args.draft_engine_dir,
+                                   device_ids=draft_device_list)
+        draft_runner = ModelRunnerCpp.from_dir(**draft_runner_kwargs)
+
+
+    if is_dtm and (use_logits) and \
         not (draft_runner.gather_generation_logits and target_runner.gather_generation_logits):
         assert False, "`--gather_generation_logits` must be specified while building draft/target models for using logits to accept"
 
@@ -240,120 +234,141 @@ def run_dtm_pld(batch_input_ids,
         return_all_generated_tokens=args.return_all_generated_tokens,
     )
 
-    while True:
-        n_iteration += 1
-        # Dynamic batch_size, decreases if some requests finish
-        batch_size = len(prefix)
-        prefix_len = [len(prefix[i]) for i in range(batch_size)]
-        # Get draft tokens
-        # `d_*` means variables from draft
-        # `d_seq_len` includes input part, but `d_len` doesn't
-        if is_dtm:
-            draft_generation_kwargs = common_generaion_kwargs.copy()
-            draft_generation_kwargs.update(
-                batch_input_ids=prefix,
-                max_new_tokens=draft_len,
-                streaming=False,
-                output_sequence_lengths=True,
-                return_dict=True,
-            )
-            draft = draft_runner.generate(**draft_generation_kwargs)
+    num_profile_iters = 11 if args.run_profiling else 1
+    for profile_iter in range(num_profile_iters):
+        if profile_iter == 1:
+            start = time.time()
+        # Variables changing during decoding
+        n_iteration = 0
+        prefix = batch_input_ids  # Input for each iteration
+        batch_slot = list(range(input_batch_size))  # Index of requests
+        if is_compute_acceptance_ratio:
+            n_draft_token = [0 for _ in range(input_batch_size)]
+            n_accept_token = [0 for _ in range(input_batch_size)]
+
+        if is_pld:
+            pld_pool = PLDPool(input_batch_size, prompt_lookup_num_tokens,
+                               max_matching_ngram_size, end_id, max_seq_len)
+
+        while True:
+            n_iteration += 1
+            # Dynamic batch_size, decreases if some requests finish
+            batch_size = len(prefix)
+            prefix_len = [len(prefix[i]) for i in range(batch_size)]
+            # Get draft tokens
+            # `d_*` means variables from draft
+            # `d_seq_len` includes input part, but `d_len` doesn't
+            if is_dtm:
+                draft_generation_kwargs = common_generaion_kwargs.copy()
+                draft_generation_kwargs.update(
+                    batch_input_ids=prefix,
+                    max_new_tokens=draft_len,
+                    streaming=False,
+                    output_sequence_lengths=True,
+                    return_dict=True,
+                )
+                draft = draft_runner.generate(**draft_generation_kwargs)
+                torch.cuda.synchronize()
+
+                # draft["output_ids"].shape -> [BS, BW, maxSL]
+                # draft["sequence_lengths"].shape -> [BS, BW]
+                # draft["generation_logits"].shape -> [BS, BW, draft_len, vocab_size]
+                d_ids = [[end_id]] * batch_size
+                d_logits = [None] * batch_size if use_logits else None
+                d_seq_len = draft["sequence_lengths"][:, 0].tolist()
+                d_len = [
+                    d_seq_len[bi] - prefix_len[bi] for bi in range(batch_size)
+                ]
+                for bi in range(batch_size):
+                    l, r = prefix_len[bi], d_seq_len[bi]
+                    if l >= r:  # No useful draft tokens
+                        continue
+                    d_ids[bi] = draft["output_ids"][bi, 0, l:r].tolist()
+                    if use_logits:
+                        d_logits[bi] = draft["generation_logits"][
+                            bi, 0, -d_len[bi]:, :]
+            if is_pld:
+                d_ids, d_logits = pld_pool.get_draft_tokens(prefix, batch_slot)
+                d_len = [len(i) for i in d_ids]
+
+            # Run target model
+            # `t_*` means variables from target model
+            # `t_seq_len` and `t_seq_ids` include input part, but `t_len` or `t_ids` don't
+            target_generation_kwargs = common_generaion_kwargs.copy()
+            target_generation_kwargs.update(batch_input_ids=prefix,
+                                            draft_tokens_list=d_ids,
+                                            draft_logits_list=d_logits)
+            if is_dtm:
+                max_new_tokens = draft_len + 1
+            if is_pld:
+                max_new_tokens = prompt_lookup_num_tokens + 1
+            target_generation_kwargs.update(max_new_tokens=max_new_tokens)
+            target = target_runner.generate(**target_generation_kwargs)
             torch.cuda.synchronize()
 
-            # draft["output_ids"].shape -> [BS, BW, maxSL]
-            # draft["sequence_lengths"].shape -> [BS, BW]
-            # draft["generation_logits"].shape -> [BS, BW, draft_len, vocab_size]
-            d_ids = [[end_id]] * batch_size
-            d_logits = [None] * batch_size if use_logits else None
-            d_seq_len = draft["sequence_lengths"][:, 0].tolist()
-            d_len = [d_seq_len[bi] - prefix_len[bi] for bi in range(batch_size)]
+            t_ids = [None] * batch_size
+            t_seq_ids = [None] * batch_size
+            t_seq_len = target["sequence_lengths"][:, 0].tolist()
+            t_len = [t_seq_len[bi] - prefix_len[bi] for bi in range(batch_size)]
+
+            # Update output and tokens for next iteration
             for bi in range(batch_size):
-                l, r = prefix_len[bi], d_seq_len[bi]
-                if l >= r:  # No useful draft tokens
-                    continue
-                d_ids[bi] = draft["output_ids"][bi, 0, l:r].tolist()
+                gbi = batch_slot[bi]  # Global index in the input batch
+                l = prefix_len[bi]
+                r = min(t_seq_len[bi], max_seq_len[gbi])
+                t_ids[bi] = target["output_ids"][bi, 0, l:r].tolist()
+                t_seq_ids[bi] = target["output_ids"][bi, 0, :r]
+                outputs["output_ids"][gbi, 0, l:r] = torch.IntTensor(t_ids[bi])
+                outputs["sequence_lengths"][gbi, 0] = r
                 if use_logits:
-                    d_logits[bi] = draft["generation_logits"][bi, 0,
-                                                              -d_len[bi]:, :]
-        if is_pld:
-            d_ids, d_logits = pld_pool.get_draft_tokens(prefix, batch_slot)
-            d_len = [len(i) for i in d_ids]
+                    outputs["generation_logits"][gbi, 0, (l - input_len[bi]):(r - input_len[bi])] = \
+                        target["generation_logits"][bi][0,:(r-l)].detach().cpu()
+                if is_compute_acceptance_ratio:
+                    n_draft_token[gbi] += d_len[bi]
+                    length = min(d_len[bi], t_len[bi],
+                                 max_seq_len[gbi] - prefix_len[bi])
+                    res = [d_ids[bi][i] == t_ids[bi][i] for i in range(length)]
+                    n_accept_token[gbi] += \
+                        ((~torch.BoolTensor(res)).cumsum(axis=-1) < 1).sum()
 
-        # Run target model
-        # `t_*` means variables from target model
-        # `t_seq_len` and `t_seq_ids` include input part, but `t_len` or `t_ids` don't
-        target_generation_kwargs = common_generaion_kwargs.copy()
-        target_generation_kwargs.update(batch_input_ids=prefix,
-                                        draft_tokens_list=d_ids,
-                                        draft_logits_list=d_logits)
-        if is_dtm:
-            max_new_tokens = draft_len + 1
-        if is_pld:
-            max_new_tokens = prompt_lookup_num_tokens + 1
-        target_generation_kwargs.update(max_new_tokens=max_new_tokens)
-        target = target_runner.generate(**target_generation_kwargs)
-        torch.cuda.synchronize()
+            # Yield output if using streaming
+            if args.streaming and not n_iteration % args.streaming_interval:
+                yield outputs
 
-        t_ids = [None] * batch_size
-        t_seq_ids = [None] * batch_size
-        t_seq_len = target["sequence_lengths"][:, 0].tolist()
-        t_len = [t_seq_len[bi] - prefix_len[bi] for bi in range(batch_size)]
-
-        # Update output and tokens for next iteration
-        for bi in range(batch_size):
-            gbi = batch_slot[bi]  # Global index in the input batch
-            l = prefix_len[bi]
-            r = min(t_seq_len[bi], max_seq_len[gbi])
-            t_ids[bi] = target["output_ids"][bi, 0, l:r].tolist()
-            t_seq_ids[bi] = target["output_ids"][bi, 0, :r]
-            outputs["output_ids"][gbi, 0, l:r] = torch.IntTensor(t_ids[bi])
-            outputs["sequence_lengths"][gbi, 0] = r
-            if use_logits:
-                outputs["generation_logits"][gbi, 0, (l - input_len[bi]):(r - input_len[bi])] = \
-                    target["generation_logits"][bi][0,:(r-l)].detach().cpu()
-            if is_compute_acceptance_ratio:
-                n_draft_token[gbi] += d_len[bi]
-                length = min(d_len[bi], t_len[bi],
-                             max_seq_len[gbi] - prefix_len[bi])
-                res = [d_ids[bi][i] == t_ids[bi][i] for i in range(length)]
-                n_accept_token[gbi] += \
-                    ((~torch.BoolTensor(res)).cumsum(axis=-1) < 1).sum()
-
-        # Yield output if using streaming
-        if args.streaming and not n_iteration % args.streaming_interval:
-            yield outputs
-
-        # Evaluate stop criteria and prepare inputs for next iteration
-        prefix_next = []
-        batch_slot_next = []
-        for bi in range(batch_size):
-            gbi = batch_slot[bi]  # Global index in the input batch
-            # Stop due to output length
-            if len(t_seq_ids[bi]) >= max_seq_len[gbi]:
-                continue  # No need to update for the stopped requests
-            # Stop due to the same output. Normally target should return 1 more token.
-            # if (d_ids is not None and np.array_equal(d_ids[bi], t_ids[bi])):
-            #     continue
-            # Stop due to no change (hit early stopping)
-            if np.array_equal(t_seq_ids[bi].cpu().numpy(),
-                              prefix[bi].cpu().numpy()):
-                continue
-            # Stop due to end words
-            if end_id in t_seq_ids[bi][prefix_len[bi]:]:
-                continue
-            # TODO: Check bad words and stop words criteria
-            prefix_next.append(t_seq_ids[bi])
-            batch_slot_next.append(gbi)
-        prefix = prefix_next
-        batch_slot = batch_slot_next
-        if len(prefix) == 0:  # Leave while loop if no request remained
-            break
+            # Evaluate stop criteria and prepare inputs for next iteration
+            prefix_next = []
+            batch_slot_next = []
+            for bi in range(batch_size):
+                gbi = batch_slot[bi]  # Global index in the input batch
+                # Stop due to output length
+                if len(t_seq_ids[bi]) >= max_seq_len[gbi]:
+                    continue  # No need to update for the stopped requests
+                # Stop due to the same output. Normally target should return 1 more token.
+                # if (d_ids is not None and np.array_equal(d_ids[bi], t_ids[bi])):
+                #     continue
+                # Stop due to no change (hit early stopping)
+                if np.array_equal(t_seq_ids[bi].cpu().numpy(),
+                                  prefix[bi].cpu().numpy()):
+                    continue
+                # Stop due to end words
+                if end_id in t_seq_ids[bi][prefix_len[bi]:]:
+                    continue
+                # TODO: Check bad words and stop words criteria
+                prefix_next.append(t_seq_ids[bi])
+                batch_slot_next.append(gbi)
+            prefix = prefix_next
+            batch_slot = batch_slot_next
+            if len(prefix) == 0:  # Leave while loop if no request remained
+                break
+    if args.run_profiling:
+        end = time.time()
+        print(f"Generation time {(end-start)/num_profile_iters} sec")
 
     if is_compute_acceptance_ratio:
-        logger.debug(f"Count of iteration(s): {n_iteration}")
-        logger.debug(f"Acceptance ratio:")
+        print(f"Count of iteration(s): {n_iteration}")
+        print(f"Acceptance ratio:")
         for i, (a, d) in enumerate(zip(n_accept_token, n_draft_token)):
-            logger.debug(f"Request {i}: {a / d * 100 :6.2f}%")
+            print(f"Request {i}: {a / d * 100 :6.2f}%")
 
     # Return runner in No-Streaming mode
     if args.streaming:
