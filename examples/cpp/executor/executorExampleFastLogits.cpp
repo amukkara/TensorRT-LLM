@@ -66,12 +66,14 @@ int main(int argc, char* argv[])
     bool const isOrchestrator = (myRank == 0);
 
     auto kvCacheConfig = tle::KvCacheConfig(true /* enableBlockReuse */);
+    kvCacheConfig.setFreeGpuMemoryFraction(0.5);
     executorConfig.setKvCacheConfig(kvCacheConfig);
 
     auto orchestratorConfig
         = tle::OrchestratorConfig(isOrchestrator, "" /* workerExecutablePath */, nullptr, false /* spawnPrcesses */);
     auto parallelConfig = tle::ParallelConfig(tle::CommunicationType::kMPI, tle::CommunicationMode::kORCHESTRATOR,
         std::nullopt, std::nullopt, orchestratorConfig);
+    parallelConfig.setDeviceIds({0, 1});
     executorConfig.setParallelConfig(parallelConfig);
 
     auto specDecConfig = tle::SpeculativeDecodingConfig(runtimeOpts.fastLogits);
@@ -82,45 +84,47 @@ int main(int argc, char* argv[])
 
     if (isOrchestrator)
     {
+        auto executorConfigTarget = executorConfig;
+        parallelConfig.setParticipantIds({1, 2});
+        executorConfigTarget.setParallelConfig(parallelConfig);
+
+        targetExecutor = std::make_unique<tle::Executor>(
+            runtimeOpts.trtEnginePath, tle::ModelType::kDECODER_ONLY, executorConfigTarget);
+
         auto executorConfigDraft = executorConfig;
-        parallelConfig.setParticipantIds({1});
+        parallelConfig.setParticipantIds({3, 4});
         executorConfigDraft.setParallelConfig(parallelConfig);
 
         draftExecutor = std::make_unique<tle::Executor>(
             runtimeOpts.trtDraftEnginePath, tle::ModelType::kDECODER_ONLY, executorConfigDraft);
-
-        parallelConfig.setParticipantIds({2});
-        executorConfig.setParallelConfig(parallelConfig);
-
-        targetExecutor
-            = std::make_unique<tle::Executor>(runtimeOpts.trtEnginePath, tle::ModelType::kDECODER_ONLY, executorConfig);
     }
-    else if (myRank == 1) // draft model process
+    else if (myRank == 1 or myRank == 2) // target model process
     {
-        parallelConfig.setParticipantIds({1});
-        parallelConfig.setDeviceIds({0});
-        executorConfig.setParallelConfig(parallelConfig);
-        draftExecutor = std::make_unique<tle::Executor>(
-            runtimeOpts.trtDraftEnginePath, tle::ModelType::kDECODER_ONLY, executorConfig);
-    }
-    else if (myRank == 2) // target model process
-    {
-        parallelConfig.setParticipantIds({2});
-        parallelConfig.setDeviceIds({1});
+        parallelConfig.setParticipantIds({1, 2});
         executorConfig.setParallelConfig(parallelConfig);
         targetExecutor
             = std::make_unique<tle::Executor>(runtimeOpts.trtEnginePath, tle::ModelType::kDECODER_ONLY, executorConfig);
         ;
     }
+    else if (myRank == 3 or myRank == 4) // draft model process
+    {
+        parallelConfig.setParticipantIds({3, 4});
+        executorConfig.setParallelConfig(parallelConfig);
+        draftExecutor = std::make_unique<tle::Executor>(
+            runtimeOpts.trtDraftEnginePath, tle::ModelType::kDECODER_ONLY, executorConfig);
+    }
 
     // Only orchestrator rank (rank 0) will enter
     if (isOrchestrator)
     {
-        auto draftResult = executeDraftRequest(*draftExecutor, runtimeOpts);
+        for (int i = 0; i < 5; i++)
+        {
+            auto draftResult = executeDraftRequest(*draftExecutor, runtimeOpts);
 
-        executeTargetRequest(*targetExecutor, draftResult, runtimeOpts);
+            executeTargetRequest(*targetExecutor, draftResult, runtimeOpts);
+        }
     }
-    TLLM_LOG_INFO("Exiting.");
+    TLLM_LOG_INFO("Rank %d Exiting.", myRank);
     return 0;
 }
 
