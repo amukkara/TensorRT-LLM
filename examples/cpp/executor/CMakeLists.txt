@@ -59,14 +59,14 @@ message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
 
 # TRT dependencies
-set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
+set_ifndef(TRT_LIB_DIR ${TRTLLM_BUILD_DIR}/tensorrt_llm/plugins)
 set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
 set(TRT_LIB nvinfer)
 # On Windows major version is appended to nvinfer libs.
 if(WIN32)
   set(TRT_LIB_NAME nvinfer_10)
 else()
-  set(TRT_LIB_NAME nvinfer)
+  set(TRT_LIB_NAME nvinfer_plugin_tensorrt_llm)
 endif()
 find_library_create_target(${TRT_LIB} ${TRT_LIB_NAME} SHARED ${TRT_LIB_DIR})
 message(${TRT_INCLUDE_DIR})
