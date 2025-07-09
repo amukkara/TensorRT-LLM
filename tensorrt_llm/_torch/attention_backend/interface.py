@@ -128,6 +128,9 @@ class AttentionMetadata:
     # The max number of tokens among all ranks.
     all_rank_max_num_tokens: Optional[int] = None
 
+    prevent_kv_cache_update: bool = False
+    "For this call, don't update the KV-cache."
+
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
     # during execution. If the calculation happens during execution, torch compile treats it
     # as DDS and fails to compile.

@@ -609,11 +609,23 @@ class ExecutorRequestQueue:
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
+            # Pass block prediction configuration if available
+            block_pred_config = None
+            if hasattr(self, 'block_prediction_sampler'
+                       ) and self.block_prediction_sampler is not None:
+                block_pred_config = {
+                    'enable_block_prediction': True,
+                    'block_size': self.block_prediction_sampler.block_size,
+                    'mask_token_id': self.block_prediction_sampler.mask_token_id
+                }
             req_with_children = []
             for req_item in new_requests:
                 req = executor_request_to_llm_request(
-                    req_item.id, req_item.request, req_item.child_req_ids,
-                    self._should_exclude_last_generation_logits())
+                    req_item.id,
+                    req_item.request,
+                    req_item.child_req_ids,
+                    self._should_exclude_last_generation_logits(),
+                    block_prediction_config=block_pred_config)
                 req_with_children.append(req)
                 if req.child_requests:
                     req_with_children.extend(req.child_requests)

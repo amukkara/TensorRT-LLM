@@ -751,6 +751,250 @@ class TorchSampler(Sampler):
             offset += steps
 
 
+@dataclass
+class SampleStateBlockPrediction(SampleState):
+    """Sample state for block prediction with masked chunks."""
+    masked_chunks: Optional[
+        torch.Tensor] = None  # [batch_size, block_size] tensor of masked tokens
+    block_probs: Optional[
+        torch.Tensor] = None  # [batch_size, block_size] tensor of probabilities
+    block_tokens: Optional[
+        torch.
+        Tensor] = None  # [batch_size, block_size] tensor of predicted tokens
+    iteration_count: Optional[int] = None  # Number of iterations performed
+
+
+class BlockPredictionSampler(TorchSampler):
+    """
+    Sampler for block prediction where we allocate a block of N tokens, all starting as masked tokens,
+    then run forward passes with no causal mask, unmasking tokens with softmax probabilities greater than a threshold.
+    """
+
+    def __init__(self,
+                 args: TorchSampler.Args,
+                 block_size: int = 8,
+                 keep_threshold: float = 0.8,
+                 mask_token_id: int = 151666,
+                 max_iterations: int = 10):
+        super().__init__(args)
+        self.block_size = block_size
+        self.keep_threshold = keep_threshold
+        self.mask_token_id = mask_token_id
+        self.max_iterations = max_iterations
+
+    def sample_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs) -> SampleStateBlockPrediction:
+        """
+        Sample tokens using block prediction with iterative unmasking.
+        """
+
+        # Extract logits from model outputs
+        logits = model_outputs["logits"]
+        # print(f"[BLOCK_PREDICTION] Logits shape: {logits.shape}")
+
+        batch_size = scheduled_requests.batch_size
+
+        # Initialize or retrieve existing masked chunks
+        if hasattr(scheduled_requests, '_block_prediction_state'):
+            # Continue from previous iteration
+            masked_chunks = scheduled_requests._block_prediction_state[
+                'masked_chunks']
+            iteration_count = scheduled_requests._block_prediction_state[
+                'iteration_count'] + 1
+            # print(f"[BLOCK_PREDICTION] Continuing from iteration {iteration_count}")
+        else:
+            # First iteration - initialize masked chunks
+            masked_chunks = torch.full((batch_size, self.block_size),
+                                       self.mask_token_id,
+                                       dtype=torch.int64,
+                                       device=logits.device)
+            iteration_count = 1
+
+        # Track probabilities and predicted tokens for this iteration
+        block_probs = torch.zeros((batch_size, self.block_size),
+                                  dtype=logits.dtype,
+                                  device=logits.device)
+        block_tokens = torch.zeros((batch_size, self.block_size),
+                                   dtype=torch.int64,
+                                   device=logits.device)
+
+        # Extract logits for the block positions
+        if logits.dim() == 3:
+            # Standard case: [batch_size, seq_len, vocab_size]
+            if logits.size(1) >= self.block_size:
+                block_logits = logits[:, -self.block_size:, :]
+            else:
+                # If sequence length is less than block size, pad or truncate
+                block_logits = torch.zeros(
+                    (batch_size, self.block_size, logits.size(-1)),
+                    device=logits.device,
+                    dtype=logits.dtype)
+                block_logits[:, :logits.size(1), :] = logits
+        elif logits.dim() == 2:
+            # Missing batch dimension, add it back in
+            block_logits = logits[-self.block_size:]
+            block_logits = block_logits.unsqueeze(0)
+        else:
+            raise ValueError(f"Not implemented for shape {logits.shape}")
+
+        # Compute probabilities
+        probs = torch.softmax(block_logits, dim=-1)
+
+        # Get predicted tokens (argmax)
+        pred_tokens = torch.argmax(block_logits, dim=-1)
+
+        # Get confidence scores (max probability for each position)
+        confidence_scores = torch.max(probs, dim=-1)[0]
+
+        # Update masked chunks based on confidence threshold
+        # Always unmask at least one token (the one with highest confidence)
+        tokens_unmasked_this_iteration = 0
+
+        for batch_idx in range(batch_size):
+            # Find positions that are still masked
+            masked_positions = (masked_chunks[batch_idx] == self.mask_token_id)
+
+            if not torch.any(masked_positions):
+                continue
+
+            # Get confidence scores for masked positions
+            masked_confidences = confidence_scores[batch_idx][masked_positions]
+            masked_pred_tokens = pred_tokens[batch_idx][masked_positions]
+
+            # Find positions above threshold
+            above_threshold = masked_confidences > self.keep_threshold
+
+            # Always unmask at least one token (highest confidence)
+            if not torch.any(above_threshold) and torch.any(masked_positions):
+                # Find the position with highest confidence
+                max_conf_idx = torch.argmax(masked_confidences)
+                above_threshold[max_conf_idx] = True
+
+            # Update the masked chunks
+            masked_indices = torch.where(masked_positions)[0]
+            update_indices = masked_indices[above_threshold]
+
+            if len(update_indices) > 0:
+                masked_chunks[
+                    batch_idx,
+                    update_indices] = masked_pred_tokens[above_threshold]
+                block_probs[
+                    batch_idx,
+                    update_indices] = masked_confidences[above_threshold]
+                block_tokens[
+                    batch_idx,
+                    update_indices] = masked_pred_tokens[above_threshold]
+                tokens_unmasked_this_iteration += len(update_indices)
+
+                # Print the details of newly unmasked tokens for this batch
+                # newly_unmasked_tokens = masked_pred_tokens[above_threshold].cpu().tolist()
+                # print(f"[BLOCK_PREDICTION] Iter {iteration_count} - batch {batch_idx}: "
+                #       f"unmasked {len(update_indices)} tokens -> {newly_unmasked_tokens}")
+
+        # print(f"[BLOCK_PREDICTION] Iteration {iteration_count} completed: "
+        #       f"{tokens_unmasked_this_iteration} tokens unmasked")
+
+        # Check if all tokens are unmasked
+        all_unmasked = torch.all(masked_chunks != self.mask_token_id)
+
+        if all_unmasked:
+            # print(f"[BLOCK_PREDICTION] All tokens unmasked after {iteration_count} iterations")
+            # Block is complete - return the first token for each batch
+            final_tokens = masked_chunks[:,
+                                         0]  # Take first token from each block
+
+            # Create a standard SampleState with the final tokens
+            new_tokens_device = final_tokens.to('cuda', non_blocking=True)
+            new_tokens_host = final_tokens.to('cpu', non_blocking=True)
+            sampler_event = torch.cuda.Event()
+            sampler_event.record()
+
+            # Clear the block prediction state
+            if hasattr(scheduled_requests, '_block_prediction_state'):
+                delattr(scheduled_requests, '_block_prediction_state')
+
+            return SampleStateBlockPrediction(
+                scheduled_requests=scheduled_requests,
+                device=SampleStateTensors(new_tokens=new_tokens_device,
+                                          logits=logits),
+                host=SampleStateTensors(new_tokens=new_tokens_host),
+                sampler_event=sampler_event,
+                masked_chunks=masked_chunks,
+                block_probs=block_probs,
+                block_tokens=block_tokens,
+                iteration_count=iteration_count)
+        else:
+            # print(f"[BLOCK_PREDICTION] Block not complete, {torch.sum(masked_chunks == self.mask_token_id)} tokens still masked")
+
+            # Block is not complete - store state for next iteration
+            scheduled_requests._block_prediction_state = {
+                'masked_chunks': masked_chunks,
+                'iteration_count': iteration_count
+            }
+
+            # Return a special state indicating the block needs more iterations
+            # The executor should detect this and continue the block prediction loop
+            return SampleStateBlockPrediction(
+                scheduled_requests=scheduled_requests,
+                device=None,  # No new tokens to add yet
+                host=None,
+                sampler_event=None,
+                masked_chunks=masked_chunks,
+                block_probs=block_probs,
+                block_tokens=block_tokens,
+                iteration_count=iteration_count)
+
+    def update_requests(self, state: SampleStateBlockPrediction) -> None:
+        """
+        Update requests with block prediction results.
+
+        Args:
+            state: The block prediction sample state
+        """
+        if state.sampler_event:
+            state.sampler_event.synchronize()
+
+        scheduled_requests = state.scheduled_requests
+
+        # TODO(marcelroed): state.host is None when the block is not complete
+        assert state.host is not None
+        new_tokens_host = state.host.new_tokens
+
+        for batch_idx, request in enumerate(scheduled_requests.all_requests):
+            if request.is_context_init_state:
+                continue
+
+            # Add the first new token to the request
+            new_token = new_tokens_host[batch_idx]
+            request.add_new_token(new_token, 0)
+
+            # Store block prediction results in the request for potential future use
+            if not hasattr(request, 'py_block_prediction_results'):
+                request.py_block_prediction_results = {}
+
+            request.py_block_prediction_results.update({
+                'masked_chunks':
+                state.masked_chunks[batch_idx]
+                if state.masked_chunks is not None else None,
+                'block_probs':
+                state.block_probs[batch_idx]
+                if state.block_probs is not None else None,
+                'block_tokens':
+                state.block_tokens[batch_idx]
+                if state.block_tokens is not None else None,
+                'iteration_count':
+                state.iteration_count,
+                'block_size':
+                self.block_size,
+                'keep_threshold':
+                self.keep_threshold,
+            })
+
+            # Increment the decoding iteration counter
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                request.py_decoding_iter += 1
+
+
 class Algorithms:
 
     def defined_algorithms(self):

@@ -30,8 +30,8 @@ from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, PeftCacheManager,
                                ResourceManager, ResourceManagerType)
-from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
-                      TRTLLMSampler)
+from .sampler import (BlockPredictionSampler, EarlyStopSampler,
+                      EarlyStopWithMMResult, TorchSampler, TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
@@ -701,6 +701,13 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     if executor_config.mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
+    if pytorch_backend_config.enable_block_prediction:
+        return BlockPredictionSampler(
+            sampler_args,
+            block_size=pytorch_backend_config.block_size,
+            keep_threshold=pytorch_backend_config.keep_threshold,
+            mask_token_id=pytorch_backend_config.mask_token_id,
+            max_iterations=pytorch_backend_config.max_iterations)
     if pytorch_backend_config.sampler_type == SamplerType.TRTLLMSampler or (
             pytorch_backend_config.sampler_type == SamplerType.auto
             and decoding_mode.isBeamSearch()):

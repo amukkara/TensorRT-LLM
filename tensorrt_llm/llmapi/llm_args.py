@@ -2329,6 +2329,23 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    # Block prediction configuration
+    enable_block_prediction: bool = Field(
+        default=False,
+        description="Enable block prediction for faster generation.")
+    block_size: int = Field(
+        default=8, description="Number of tokens to predict in each block.")
+    keep_threshold: float = Field(
+        default=0.8,
+        description=
+        "Confidence threshold for keeping tokens in block prediction.")
+    mask_token_id: int = Field(
+        default=151666,
+        description="Token ID to use as mask in block prediction.")
+    max_iterations: int = Field(
+        default=10,
+        description="Maximum number of iterations for block prediction.")
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -2603,7 +2620,12 @@ class TorchLlmArgs(BaseLlmArgs):
             attention_dp_batching_wait_iters=self.attention_dp_config.
             batching_wait_iters if self.attention_dp_config is not None else
             AttentionDpConfig.model_fields['batching_wait_iters'].default,
-            batch_wait_timeout_ms=self.batch_wait_timeout_ms)
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            enable_block_prediction=self.enable_block_prediction,
+            block_size=self.block_size,
+            keep_threshold=self.keep_threshold,
+            mask_token_id=self.mask_token_id,
+            max_iterations=self.max_iterations)
 
 
 def update_llm_args_with_extra_dict(

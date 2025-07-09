@@ -46,7 +46,8 @@ from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
-from .sampler import Sampler, SampleState, SampleStateTensors
+from .sampler import (Sampler, SampleState, SampleStateBlockPrediction,
+                      SampleStateTensors)
 from .scheduler import RequestScheduler, ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -179,6 +180,7 @@ class PyExecutor:
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.block_prediction_enabled = model_engine.pytorch_backend_config.enable_block_prediction
 
         # enqueue and _fetch_new_requests used data
         self.active = True
@@ -256,7 +258,13 @@ class PyExecutor:
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
-        if self.dist.pp_size > 1:
+        # Select the correct event loop
+        if self.block_prediction_enabled:
+            if self.dist.pp_size != 1:
+                raise ValueError(
+                    "Block prediction is only supported in single process")
+            self.event_loop = self._executor_loop_block
+        elif self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
         else:
             self.event_loop = self._executor_loop if disable_overlap_scheduler else self._executor_loop_overlap
@@ -1075,6 +1083,265 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
+    def _executor_loop_block(self):
+        """Executor loop for block prediction with iterative unmasking."""
+        torch.cuda.set_device(self.device_id)
+        with self._profiler() as profile_step:
+            while not self.is_shutdown or len(self.active_requests) > 0:
+                profile_step()
+                _new_requests = self._fetch_and_activate_new_requests()
+                if self.is_shutdown and len(self.active_requests) == 0:
+                    break
+
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+                )
+
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
+
+                self._pause_requests(scheduled_batch.paused_requests)
+
+                finished_requests = []
+
+                if scheduled_batch.batch_size > 0:
+                    self.resource_manager.prepare_resources(scheduled_batch)
+
+                    # Even though this computes the entire prefix cache in the first iteration, it only outputs
+                    # logits for the current block undergoing generation.
+                    # We need to make sure the last block's logits are NOT cached
+                    batch_outputs = self._forward_step(scheduled_batch)
+
+                    sample_state = self._sample_async_block(
+                        scheduled_batch, batch_outputs)
+
+                    self._update_request_states(scheduled_batch)
+                    self._update_requests(sample_state)
+
+                    self._handle_canceled_requests()
+                    finished_requests = self._handle_responses()
+                    self.resource_manager.update_resources(scheduled_batch)
+        return
+
+        with self._profiler() as profile_step:
+            iter_start_time = time.time()
+            iter_stats = None
+            while not self.is_shutdown or len(self.active_requests) > 0:
+                profile_step()
+                if self.enable_iter_perf_stats:
+                    iter_start_time = time.time()
+
+                new_requests = self._fetch_new_requests()
+                if self.is_shutdown and len(self.active_requests) == 0:
+                    break
+
+                if self.kv_cache_transceiver:
+                    self._check_disagg_gen_transfer_status()
+
+                if self.enable_iter_perf_stats:
+                    iter_stats = self._get_init_iter_stats(
+                        len(new_requests),
+                        self.new_active_requests_queue_latency_ms)
+
+                self._pad_attention_dp_dummy_request()
+
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+                )
+
+                if self.kv_cache_transceiver:
+                    # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
+                    self._prepare_disagg_gen_init(
+                        fitting_disagg_gen_init_requests)
+                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+                        logger.warning(
+                            "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                        )
+                        self.kv_cache_transceiver.check_context_transfer_status(
+                            1)
+                else:
+                    assert scheduled_batch.batch_size > 0, (
+                        "fail to schedule any pending request, "
+                        "probably run out of resource.")
+
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
+
+                self._pause_requests(scheduled_batch.paused_requests)
+
+                finished_requests = []
+
+                if scheduled_batch.batch_size > 0:
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
+                    self.resource_manager.prepare_resources(scheduled_batch)
+
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
+                        # Return the first token to the client
+                        self._handle_first_token_response(scheduled_batch)
+
+                    # Process the batch with iterative block prediction
+                    self._process_block_prediction_batch(scheduled_batch)
+
+                    self._update_request_states(scheduled_batch)
+                    # self._update_requests(sample_state)
+
+                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                        scheduled_batch.context_requests
+                    ) if self.kv_cache_transceiver else []
+
+                    if self.kv_cache_transceiver:
+                        # For context only req in transmission, we reset the state since sampler might have changed it
+                        for req in ctx_transmission_reqs:
+                            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+                    self._handle_cancelled_requests()
+                    finished_requests = self._handle_responses()
+                    self.resource_manager.update_resources(scheduled_batch)
+                    if self.enable_kv_cache_events:
+                        self._add_kv_cache_events()
+
+                if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._terminate_ctx_finished_requests()
+
+                if self.enable_iter_perf_stats:
+                    iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                        'num_ctx_tokens']
+                    self._process_iter_stats(
+                        finished_requests, self.active_requests,
+                        BatchState(sample_state=SampleState(
+                            scheduled_requests=scheduled_batch),
+                                   iter_stats=iter_stats,
+                                   iter_start_time=iter_start_time))
+
+    def _process_block_prediction_batch(self, scheduled_batch):
+        """Process a batch with iterative block prediction."""
+        # print(f"[BLOCK_PREDICTION] Processing batch with {len(scheduled_batch.generation_requests)} generation requests")
+
+        max_iterations: int = getattr(self.sampler, 'max_iterations', 10)
+        iteration = 0
+        while iteration < max_iterations:
+            # Forward step to get initial logits
+            batch_outputs = self._forward_step_block(scheduled_batch)
+
+            # Iterative block prediction loop
+            # if iteration < max_iterations:
+            iteration += 1
+            # print(f"[BLOCK_PREDICTION] Block prediction iteration {iteration}")
+
+            # Sample tokens using block prediction
+            sample_state = self._sample_async_block(scheduled_batch,
+                                                    batch_outputs)
+
+            if sample_state is not None:
+                # print("[BLOCK_PREDICTION] Sample state is None, breaking")
+
+                # Check if block prediction is complete
+                if hasattr(sample_state,
+                           'device') and sample_state.device is not None:
+                    # Block is complete - update requests and break
+                    print(
+                        "[BLOCK_PREDICTION] Block prediction complete, updating requests (TODO(marcelroed): check why/when this happens)"
+                    )
+                    self._update_requests(sample_state)
+                    break
+                else:
+                    # Block is not complete - continue iteration
+                    print(
+                        f"[BLOCK_PREDICTION] Block not complete, continuing iteration {iteration}"
+                    )
+
+                    # Update the requests with the current masked chunks for the next forward pass
+                    self._update_requests_for_next_iteration(sample_state)
+                    # self._update_requests(sample_state)
+
+                    # Run another forward step with the updated masked chunks
+                    # batch_outputs = self._forward_step_block(scheduled_batch)
+
+        if iteration >= max_iterations:
+            # print(f"[BLOCK_PREDICTION] Reached max iterations ({max_iterations}), forcing completion")
+            # Force completion by taking the first token from each block
+            self._force_block_completion(scheduled_batch)
+
+    def _update_requests_for_next_iteration(
+            self, sample_state: SampleStateBlockPrediction):
+        """Update requests with masked chunks for the next iteration."""
+        if sample_state.masked_chunks is not None:
+            # For block prediction, we need to create new requests with the current state
+            # instead of modifying existing requests, which breaks the KV cache manager
+            new_requests = []
+
+            for i, request in enumerate(
+                    sample_state.scheduled_requests.generation_requests):
+                if i < sample_state.masked_chunks.size(0):
+                    # Create a new request with the current tokens plus the masked chunk
+                    masked_chunk = sample_state.masked_chunks[i]
+
+                    # Get the current tokens (excluding the last block_size tokens that were just processed)
+                    current_tokens = []
+                    for beam_idx in range(request.max_beam_num_tokens):
+                        # Get all tokens for this beam
+                        all_beam_tokens = request.get_tokens(0)
+                        # Remove the last block_size tokens that were just processed
+                        beam_tokens = all_beam_tokens[:-self.sampler.block_size]
+                        current_tokens.extend(beam_tokens)
+
+                    # Add the masked chunk tokens
+                    current_tokens.extend(masked_chunk.tolist())
+
+                    # For now, just mark the request as needing another iteration
+                    request.py_needs_block_iteration = True
+                    new_requests.append(request)
+
+            # Update the scheduled requests with the new requests
+            sample_state.scheduled_requests.generation_requests = new_requests
+
+    def _force_block_completion(self, scheduled_batch):
+        """Force completion of block prediction by taking the first token from each block."""
+        # print("[BLOCK_PREDICTION] Forcing block completion")
+
+        # Create a dummy sample state with the first token from each block
+        batch_size = len(scheduled_batch.generation_requests)
+        first_tokens = torch.zeros(batch_size, dtype=torch.int64, device='cuda')
+
+        for i, request in enumerate(scheduled_batch.generation_requests):
+            # Get the first token from the block (or a default token if none available)
+            if request.get_num_tokens(0) > 0:
+                first_tokens[i] = request.get_token(0, 0)
+            else:
+                first_tokens[i] = 0  # Default token
+
+        # Create a sample state with the first tokens
+        new_tokens_host = first_tokens.to('cpu', non_blocking=True)
+        sampler_event = torch.cuda.Event()
+        sampler_event.record()
+
+        sample_state = SampleStateBlockPrediction(
+            scheduled_requests=scheduled_batch,
+            logits=None,
+            device=SampleStateTensors(new_tokens=first_tokens),
+            host=SampleStateTensors(new_tokens=new_tokens_host),
+            sampler_event=sampler_event,
+            masked_chunks=None,
+            block_probs=None,
+            block_tokens=None,
+            iteration_count=0)
+
+        self._update_requests(sample_state)
+
     def _prepare_draft_requests(self):
         try:
             # Set draft tokens here to make the KV cache manager
@@ -1518,9 +1785,15 @@ class PyExecutor:
                 cache_indirection_buffer=cache_indirection_buffer)
 
         try:
-            gather_context_logits = any(
-                a.py_return_context_logits
-                for a in scheduled_requests.context_requests)
+            # For block prediction we need logits for every position in the newly allocated block, not
+            # just for the last token.  Force `gather_context_logits` to True when the block-prediction
+            # sampler is active so the model forward pass returns the full per-token logits tensor.
+            if self.block_prediction_enabled:
+                gather_context_logits = True
+            else:
+                gather_context_logits = any(
+                    a.py_return_context_logits
+                    for a in scheduled_requests.context_requests)
             cache_indirection_buffer = self.sampler.get_cache_indirection()
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device, gather_context_logits,
@@ -1606,6 +1879,26 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
+    @nvtx_range("_sample_async_block")
+    def _sample_async_block(self, scheduled_batch,
+                            batch_outputs) -> SampleStateBlockPrediction | None:
+        try:
+            if batch_outputs is not None:
+                assert self.block_prediction_enabled
+                return self.sampler.sample_async(scheduled_batch, batch_outputs)
+            else:
+                # Return a dummy sample state if no batch outputs
+                return SampleStateBlockPrediction(
+                    scheduled_requests=scheduled_batch)
+        except Exception as e:
+            traceback.print_exc()
+            error_msg = str(e)
+            logger.error(f"Encountered an error in sampling: {error_msg}")
+            self._handle_errors(error_msg)
+            # Return a dummy sample state to prevent None errors
+            return SampleStateBlockPrediction(
+                scheduled_requests=scheduled_batch)
+
     @nvtx_range("_setup_sampler_step")
     def _setup_sampler_step(self, requests: ScheduledRequests):
         try:
@@ -1617,8 +1910,12 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
-    def _update_requests(self, sample_state: SampleState):
+    def _update_requests(self, sample_state: SampleState
+                         | SampleStateBlockPrediction):
         try:
+            if self.block_prediction_enabled:
+                assert isinstance(sample_state, SampleStateBlockPrediction), \
+                    "SampleState must be of type SampleStateBlockPrediction when using block prediction sampler"
             self.sampler.update_requests(sample_state)
         except Exception as e:
             traceback.print_exc()

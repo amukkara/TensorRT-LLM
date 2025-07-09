@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import bisect
 import contextlib
 import copy
@@ -10,6 +12,7 @@ import traceback
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -67,6 +70,45 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
 from .scheduler import ScheduledRequests
 
 MAX_UINT64 = (1 << 64) - 1
+
+
+@dataclass
+class MaskedChunk:
+    tokens: torch.Tensor
+    update_steps: int = 0
+
+    mask_token_id: int = 151_666
+    keep_threshold: float = 0.8
+
+    def is_done(self) -> torch.Tensor:
+        return torch.any(self.tokens == self.mask_token_id
+                         )  # Do this on GPU, move bool to CPU if/when needed
+
+    def update_tokens(self, probs: torch.Tensor,
+                      pred_tokens: torch.Tensor) -> MaskedChunk:
+        return replace(self,
+                       tokens=torch.where(probs > self.keep_threshold,
+                                          pred_tokens, self.tokens),
+                       update_steps=self.update_steps + 1)
+
+    def __init__(self,
+                 n_tokens: int | None = None,
+                 tokens: torch.Tensor | None = None,
+                 keep_threshold: float | None = None,
+                 mask_token_id: int | None = None):
+        self.mask_token_id = mask_token_id or self.mask_token_id
+        self.keep_threshold = keep_threshold or self.keep_threshold
+        self.update_steps = 0
+
+        if tokens is not None:
+            self.tokens = tokens
+        elif n_tokens is not None:
+            self.tokens = torch.full((n_tokens, ),
+                                     self.mask_token_id,
+                                     dtype=torch.int,
+                                     device='cuda')
+        else:
+            raise ValueError("Either n_tokens or tokens must be provided")
 
 
 class ModelEngine(ABC):
@@ -1422,7 +1464,45 @@ class PyTorchModelEngine(ModelEngine):
                     # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                     # can be aligned to the correct positions.
                     if not request.is_cuda_graph_dummy:
-                        input_ids.append(request.get_last_tokens(beam))
+                        if not self.pytorch_backend_config.enable_block_prediction:
+                            input_ids.append(request.get_last_tokens(beam))
+                        else:
+                            input_token_id = request.get_token(
+                                beam,
+                                request.get_num_tokens(beam) - 1)
+
+                            # For block prediction, we need to add the entire block of tokens
+                            # (last real token + block_size mask tokens)
+                            # print("In PTME block prediction")
+                            block_size = self.pytorch_backend_config.block_size
+                            mask_token_id = self.pytorch_backend_config.mask_token_id
+
+                            input_ids.append(input_token_id)
+                            input_ids.extend([mask_token_id] * block_size)
+
+                            # Update position IDs for the entire block
+                            # First add position ID for the last real token, then for the mask tokens
+                            last_pos_id = position_ids[
+                                -1] if position_ids else request.max_beam_num_tokens - 1
+                            position_ids.append(
+                                last_pos_id +
+                                1)  # Position for the last real token
+                            position_ids.extend(
+                                range(last_pos_id + 2, last_pos_id + 2 +
+                                      block_size))  # Positions for mask tokens
+
+                            # Update sequence length for this request (replace the 1 we added earlier)
+                            sequence_lengths[-1] = 1 + block_size
+
+                            # Update gather IDs for the entire block
+                            # Remove the single gather_id we added earlier and add gather_ids for all block tokens
+                            gather_ids.pop(
+                            )  # Remove the single gather_id we added earlier
+                            gather_ids.extend(
+                                range(
+                                    len(position_ids) - block_size,
+                                    len(position_ids)))
+
                     past_seen_token_num = request.max_beam_num_tokens - 1
                 else:
                     # the request has previous tensor
