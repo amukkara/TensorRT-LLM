@@ -1087,46 +1087,6 @@ class PyExecutor:
         """Executor loop for block prediction with iterative unmasking."""
         torch.cuda.set_device(self.device_id)
         with self._profiler() as profile_step:
-            while not self.is_shutdown or len(self.active_requests) > 0:
-                profile_step()
-                _new_requests = self._fetch_and_activate_new_requests()
-                if self.is_shutdown and len(self.active_requests) == 0:
-                    break
-
-                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
-                )
-
-                self.num_scheduled_requests = scheduled_batch.batch_size
-                logger.debug(
-                    f'has {len(self.active_requests)} active_request, '
-                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
-                    f'{len(scheduled_batch.generation_requests)} generation requests'
-                )
-
-                self._pause_requests(scheduled_batch.paused_requests)
-
-                finished_requests = []
-
-                if scheduled_batch.batch_size > 0:
-                    self.resource_manager.prepare_resources(scheduled_batch)
-
-                    # Even though this computes the entire prefix cache in the first iteration, it only outputs
-                    # logits for the current block undergoing generation.
-                    # We need to make sure the last block's logits are NOT cached
-                    batch_outputs = self._forward_step(scheduled_batch)
-
-                    sample_state = self._sample_async_block(
-                        scheduled_batch, batch_outputs)
-
-                    self._update_request_states(scheduled_batch)
-                    self._update_requests(sample_state)
-
-                    self._handle_canceled_requests()
-                    finished_requests = self._handle_responses()
-                    self.resource_manager.update_resources(scheduled_batch)
-        return
-
-        with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
             while not self.is_shutdown or len(self.active_requests) > 0:
@@ -1134,7 +1094,7 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
-                new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_and_activate_new_requests()
                 if self.is_shutdown and len(self.active_requests) == 0:
                     break
 
@@ -1208,7 +1168,7 @@ class PyExecutor:
                         for req in ctx_transmission_reqs:
                             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
-                    self._handle_cancelled_requests()
+                    self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
                     self.resource_manager.update_resources(scheduled_batch)
                     if self.enable_kv_cache_events:
@@ -1233,12 +1193,11 @@ class PyExecutor:
 
         max_iterations: int = getattr(self.sampler, 'max_iterations', 10)
         iteration = 0
+        # Iterative block prediction loop
         while iteration < max_iterations:
             # Forward step to get initial logits
-            batch_outputs = self._forward_step_block(scheduled_batch)
+            batch_outputs = self._forward_step(scheduled_batch)
 
-            # Iterative block prediction loop
-            # if iteration < max_iterations:
             iteration += 1
             # print(f"[BLOCK_PREDICTION] Block prediction iteration {iteration}")
 
@@ -1266,13 +1225,11 @@ class PyExecutor:
 
                     # Update the requests with the current masked chunks for the next forward pass
                     self._update_requests_for_next_iteration(sample_state)
-                    # self._update_requests(sample_state)
-
-                    # Run another forward step with the updated masked chunks
-                    # batch_outputs = self._forward_step_block(scheduled_batch)
 
         if iteration >= max_iterations:
-            # print(f"[BLOCK_PREDICTION] Reached max iterations ({max_iterations}), forcing completion")
+            print(
+                f"[BLOCK_PREDICTION] Reached max iterations ({max_iterations}), forcing completion"
+            )
             # Force completion by taking the first token from each block
             self._force_block_completion(scheduled_batch)
 
@@ -1331,7 +1288,6 @@ class PyExecutor:
 
         sample_state = SampleStateBlockPrediction(
             scheduled_requests=scheduled_batch,
-            logits=None,
             device=SampleStateTensors(new_tokens=first_tokens),
             host=SampleStateTensors(new_tokens=new_tokens_host),
             sampler_event=sampler_event,

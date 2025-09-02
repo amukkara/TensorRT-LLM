@@ -915,8 +915,7 @@ class BlockPredictionSampler(TorchSampler):
 
             return SampleStateBlockPrediction(
                 scheduled_requests=scheduled_requests,
-                device=SampleStateTensors(new_tokens=new_tokens_device,
-                                          logits=logits),
+                device=SampleStateTensors(new_tokens=new_tokens_device),
                 host=SampleStateTensors(new_tokens=new_tokens_host),
                 sampler_event=sampler_event,
                 masked_chunks=masked_chunks,
@@ -960,7 +959,7 @@ class BlockPredictionSampler(TorchSampler):
         assert state.host is not None
         new_tokens_host = state.host.new_tokens
 
-        for batch_idx, request in enumerate(scheduled_requests.all_requests):
+        for batch_idx, request in enumerate(scheduled_requests.all_requests()):
             if request.is_context_init_state:
                 continue
 

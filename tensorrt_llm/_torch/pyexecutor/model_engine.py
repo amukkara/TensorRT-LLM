@@ -1456,6 +1456,7 @@ class PyTorchModelEngine(ModelEngine):
         for request in generation_requests:
             beam_width = request.sampling_config.beam_width
             for beam in range(beam_width):
+                block_size = 0
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
@@ -1473,35 +1474,11 @@ class PyTorchModelEngine(ModelEngine):
 
                             # For block prediction, we need to add the entire block of tokens
                             # (last real token + block_size mask tokens)
-                            # print("In PTME block prediction")
                             block_size = self.pytorch_backend_config.block_size
                             mask_token_id = self.pytorch_backend_config.mask_token_id
 
                             input_ids.append(input_token_id)
                             input_ids.extend([mask_token_id] * block_size)
-
-                            # Update position IDs for the entire block
-                            # First add position ID for the last real token, then for the mask tokens
-                            last_pos_id = position_ids[
-                                -1] if position_ids else request.max_beam_num_tokens - 1
-                            position_ids.append(
-                                last_pos_id +
-                                1)  # Position for the last real token
-                            position_ids.extend(
-                                range(last_pos_id + 2, last_pos_id + 2 +
-                                      block_size))  # Positions for mask tokens
-
-                            # Update sequence length for this request (replace the 1 we added earlier)
-                            sequence_lengths[-1] = 1 + block_size
-
-                            # Update gather IDs for the entire block
-                            # Remove the single gather_id we added earlier and add gather_ids for all block tokens
-                            gather_ids.pop(
-                            )  # Remove the single gather_id we added earlier
-                            gather_ids.extend(
-                                range(
-                                    len(position_ids) - block_size,
-                                    len(position_ids)))
 
                     past_seen_token_num = request.max_beam_num_tokens - 1
                 else:
@@ -1517,8 +1494,18 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
-                sequence_lengths.append(1)
-                gather_ids.append(len(position_ids) - 1)
+                sequence_lengths.append(1 + block_size)
+                if block_size == 0:
+                    gather_ids.append(len(position_ids) - 1)
+                else:
+                    # Add position ids for mask tokens
+                    position_ids.extend(
+                        range(past_seen_token_num + 1,
+                              past_seen_token_num + 1 + block_size))
+                    gather_ids.extend(
+                        range(
+                            len(position_ids) - block_size - 1,
+                            len(position_ids)))
 
             request_ids.append(request.py_request_id)
             request.py_batch_idx = request.py_seq_slot
