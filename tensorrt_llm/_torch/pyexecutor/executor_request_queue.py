@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import heapq
+import os
 import queue
 import threading
 import time
@@ -68,6 +69,7 @@ class ExecutorRequestQueue:
         self.new_active_requests_queue_latency_ms = 0
         self.is_shutdown = False
         self.should_exclude_last_generation_logits = False
+        self.static_batch_size = int(os.getenv("TLLM_STATIC_BATCH_SIZE", 1))
 
     def _get_from_request_queue(
             self,
@@ -80,7 +82,12 @@ class ExecutorRequestQueue:
             if self.request_queue.empty() and (timeout_secs is None
                                                or timeout_secs > 0):
                 # if queue is empty and want to wait, wait
-                items.append(self.request_queue.get(timeout=timeout_secs))
+                queue_item = self.request_queue.get(timeout=timeout_secs)
+                items.append(queue_item)
+                if not queue_item.is_shutdown_request:
+                    while len(items) < self.static_batch_size:
+                        queue_item = self.request_queue.get()
+                        items.append(queue_item)
             else:
                 # if not empty or don't want to wait, just return all items in queue
                 while True:
