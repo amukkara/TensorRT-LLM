@@ -1,3 +1,5 @@
+from operator import getitem
+
 import torch
 from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, KeywordArg,
                                              Match, MultiOutputPattern,
@@ -65,5 +67,62 @@ def register_add_norm(custom_pass: PatternMatcherPass):
         fwd_only,
         custom_pass,
         search_fn_pattern=add_norm_pattern,
+        extra_check=extra_check,
+    )
+
+
+def register_add_norm_fp8_quant(custom_pass: PatternMatcherPass):
+    # TODO Match residual add
+    #add_Tensor = CallFunction(aten.add.Tensor,
+    #                           KeywordArg("input"), KeywordArg("residual"),
+    #                           _users=MULTIPLE)
+    add_Tensor = KeywordArg("input")
+
+    flashinfer_norm_default = CallFunction(
+        torch.ops.trtllm.flashinfer_rmsnorm.default,
+        add_Tensor,
+        KeywordArg("norm_weight"),
+        KeywordArg("eps"),
+        _users=MULTIPLE)
+
+    static_quantize = CallFunction(
+        torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor.default,
+        flashinfer_norm_default,
+        KeywordArg("scale"),
+        _users=MULTIPLE)
+    quant_out = CallFunction(getitem, static_quantize, 0)
+
+    add_norm_quant_pattern = MultiOutputPattern([quant_out])
+
+    def empty_pattern(
+        input: torch.Tensor,
+        #residual: torch.Tensor,
+        norm_weight: torch.nn.Parameter,
+        eps: float,
+        scale: torch.Tensor,
+    ):
+        return
+
+    def target_pattern(
+        input: torch.Tensor,
+        #residual: torch.Tensor,
+        norm_weight: torch.nn.Parameter,
+        eps: float,
+        scale: torch.Tensor,
+    ):
+        quant = torch.ops.trtllm.residual_rms_norm_quant_fp8.default(
+            input, norm_weight, eps, scale)
+        return quant[0]
+
+    def extra_check(match: Match) -> bool:
+        return True
+
+    register_replacement(
+        empty_pattern,
+        target_pattern,
+        [],
+        fwd_only,
+        custom_pass,
+        search_fn_pattern=add_norm_quant_pattern,
         extra_check=extra_check,
     )
