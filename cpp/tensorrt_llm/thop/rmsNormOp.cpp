@@ -45,8 +45,8 @@ else if (inputDesc[0].type == DataType::kFLOAT && mOutputType == DataType::kFP8)
     }
 #endif
 
-torch::Tensor rms_norm_quant_fp8(
-    torch::Tensor const& input, torch::Tensor const& norm_weight, double const eps, torch::Tensor const& scale)
+std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const& input, torch::Tensor const& residual,
+    torch::Tensor const& norm_weight, double const eps, torch::Tensor const& scale)
 {
     TORCH_CHECK(input.dim() == 2, "Input must be 2D tensor [batch_size, hidden_dim].");
     TORCH_CHECK(input.sizes()[0] > 0, "Batch size must be greater than 0.");
@@ -56,20 +56,21 @@ torch::Tensor rms_norm_quant_fp8(
     auto normed_output_quant = torch::empty_like(input, torch::kFloat8_e4m3fn);
     auto out = torch::empty_like(input);
 
-    using T = __nv_bfloat16;
-    using QuantT = __nv_fp8_e4m3;
     auto const num_tokens = input.sizes()[0];
     auto const hidden_dim = input.sizes()[1];
 
     auto quant_mode = tensorrt_llm::common::QuantMode::fp8Qdq();
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-    tensorrt_llm::kernels::invokeGeneralRmsNorm<T, QuantT>(static_cast<T*>(out.mutable_data_ptr()),
-        static_cast<T*>(input.data_ptr()), static_cast<T*>(norm_weight.data_ptr()), nullptr, eps, num_tokens,
-        hidden_dim, quant_mode, stream, nullptr, static_cast<float*>(scale.data_ptr()), nullptr, nullptr,
-        static_cast<QuantT*>(normed_output_quant.data_ptr()));
+    using T = __nv_bfloat16;
+    using QuantT = __nv_fp8_e4m3;
 
-    return {normed_output_quant};
+    tensorrt_llm::kernels::invokeGeneralRmsNorm<T, QuantT>(static_cast<T*>(out.mutable_data_ptr()),
+        static_cast<T*>(input.data_ptr()), static_cast<T*>(norm_weight.data_ptr()),
+        static_cast<T*>(residual.data_ptr()), eps, num_tokens, hidden_dim, quant_mode, stream, nullptr,
+        static_cast<float*>(scale.data_ptr()), nullptr, nullptr, static_cast<QuantT*>(normed_output_quant.data_ptr()));
+
+    return {normed_output_quant, out};
 }
 
 } // namespace torch_ext
@@ -77,8 +78,8 @@ torch::Tensor rms_norm_quant_fp8(
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "rms_norm_quant_fp8(Tensor input, Tensor norm_weight, "
-        "float eps, Tensor scale) -> Tensor");
+        "rms_norm_quant_fp8(Tensor input, Tensor residual, Tensor norm_weight, "
+        "float eps, Tensor scale) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

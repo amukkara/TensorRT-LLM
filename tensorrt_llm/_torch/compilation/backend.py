@@ -14,7 +14,7 @@ from tensorrt_llm import logger
 
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .patterns.ar_residual_norm import register_ar_fusions
-from .patterns.residual_add_norm import register_add_norm_fp8_quant
+from .patterns.residual_add_norm import register_add_norm_quant_fp8
 from .piecewise_optimizer import piecewise_optimizer
 from .recover_pass import recover_pass
 from .remove_copy_pass import remove_copy_for_mutates_args
@@ -78,7 +78,7 @@ class Backend:
                 register_ar_fusions(cls._custom_pass_instances, ub_enabled)
             else:
                 #register_add_norm(cls._custom_pass_instances[0])
-                register_add_norm_fp8_quant(cls._custom_pass_instances[0])
+                register_add_norm_quant_fp8(cls._custom_pass_instances[0])
         return cls._custom_pass_instances
 
     def bypass_optimization(self):

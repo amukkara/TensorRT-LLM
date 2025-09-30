@@ -71,16 +71,28 @@ def register_add_norm(custom_pass: PatternMatcherPass):
     )
 
 
-def register_add_norm_fp8_quant(custom_pass: PatternMatcherPass):
-    # TODO Match residual add
-    #add_Tensor = CallFunction(aten.add.Tensor,
-    #                           KeywordArg("input"), KeywordArg("residual"),
-    #                           _users=MULTIPLE)
-    add_Tensor = KeywordArg("input")
+#    %add_26 : [num_users=2] = call_function[target=operator.add](args = (%output_10, %add_25), kwargs = {})
+
+#    %flashinfer_rmsnorm_default_3 : [num_users=1] = call_function[target=torch.ops.trtllm.flashinfer_rmsnorm.default](args = (%add_26, %l_self_mo    dules_layers_modules_1_modules_post_attention_layernorm_parameters_weight_, 1e-06), kwargs = {})
+
+#    %static_quantize_e4m3_per_tensor_3 : [num_users=1] = call_function[target=torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor](args = (%fl    ashinfer_rmsnorm_default_3, %l_self_modules_layers_modules_1_modules_mlp_modules_gate_up_proj_parameters_input_scale_), kwargs = {})
+
+#    %qinput_3 : [num_users=1] = call_function[target=operator.getitem](args = (%static_quantize_e4m3_per_tensor_3, 0), kwargs = {})
+
+#    %t_6 : [num_users=1] = call_method[target=t](args = (%l_self_modules_layers_modules_1_modules_mlp_modules_gate_up_proj_parameters_weight_,),     kwargs = {})
+
+#    %output_11 : [num_users=1] = call_function[target=torch.ops.trtllm.cublas_scaled_mm](args = (%qinput_3, %t_6)
+
+
+def register_add_norm_quant_fp8(custom_pass: PatternMatcherPass):
+    residual_out = CallFunction(aten.add.Tensor,
+                                KeywordArg("input"),
+                                KeywordArg("residual"),
+                                _users=MULTIPLE)
 
     flashinfer_norm_default = CallFunction(
         torch.ops.trtllm.flashinfer_rmsnorm.default,
-        add_Tensor,
+        residual_out,
         KeywordArg("norm_weight"),
         KeywordArg("eps"),
         _users=MULTIPLE)
@@ -90,13 +102,16 @@ def register_add_norm_fp8_quant(custom_pass: PatternMatcherPass):
         flashinfer_norm_default,
         KeywordArg("scale"),
         _users=MULTIPLE)
-    quant_out = CallFunction(getitem, static_quantize, 0)
 
-    add_norm_quant_pattern = MultiOutputPattern([quant_out])
+    quant_out = CallFunction(getitem, static_quantize, 0, _users=1)
+    scale = CallFunction(getitem, static_quantize, 1, _users=1)
+
+    add_norm_quant_pattern = MultiOutputPattern(
+        [quant_out, residual_out, scale])
 
     def empty_pattern(
         input: torch.Tensor,
-        #residual: torch.Tensor,
+        residual: torch.Tensor,
         norm_weight: torch.nn.Parameter,
         eps: float,
         scale: torch.Tensor,
@@ -105,14 +120,18 @@ def register_add_norm_fp8_quant(custom_pass: PatternMatcherPass):
 
     def target_pattern(
         input: torch.Tensor,
-        #residual: torch.Tensor,
+        residual: torch.Tensor,
         norm_weight: torch.nn.Parameter,
         eps: float,
         scale: torch.Tensor,
     ):
-        quant_out = torch.ops.trtllm.rms_norm_quant_fp8.default(
-            input, norm_weight, eps, scale)
-        return quant_out
+        at = torch.ops.trtllm.rms_norm_quant_fp8.default(
+            input=input,
+            residual=residual,
+            norm_weight=norm_weight,
+            eps=eps,
+            scale=scale)
+        return at[0], at[1], scale
 
     def extra_check(match: Match) -> bool:
         return True

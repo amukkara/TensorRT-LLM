@@ -506,9 +506,11 @@ def _register_fake():
     @torch.library.register_fake("trtllm::rms_norm_quant_fp8")
     def _(
         input,
+        residual,
         norm_weight,
         eps,
         scale,
     ):
         quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
-        return quant_out
+        residual_out = torch.empty_like(residual)
+        return [quant_out, residual_out]
