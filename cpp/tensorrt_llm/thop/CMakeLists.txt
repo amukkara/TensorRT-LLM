@@ -83,6 +83,7 @@ add_library(
   redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
+  rmsNormOp.cpp
   dsv3RouterGemmOp.cpp
   customMoeRoutingOp.cpp
   selectiveScanOp.cpp

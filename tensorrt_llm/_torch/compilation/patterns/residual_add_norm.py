@@ -110,9 +110,9 @@ def register_add_norm_fp8_quant(custom_pass: PatternMatcherPass):
         eps: float,
         scale: torch.Tensor,
     ):
-        quant = torch.ops.trtllm.residual_rms_norm_quant_fp8.default(
+        quant_out = torch.ops.trtllm.rms_norm_quant_fp8.default(
             input, norm_weight, eps, scale)
-        return quant[0]
+        return quant_out
 
     def extra_check(match: Match) -> bool:
         return True
