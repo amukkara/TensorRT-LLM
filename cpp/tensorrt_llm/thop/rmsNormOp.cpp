@@ -32,8 +32,7 @@
 namespace torch_ext
 {
 
-std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const& input,
-    // torch::Tensor const& residual,
+std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const& input, torch::Tensor const& residual,
     torch::Tensor const& norm_weight, double const eps, torch::Tensor const& scale)
 {
     TORCH_CHECK(input.dim() == 2, "Input must be 2D tensor [batch_size, hidden_dim].");
@@ -41,8 +40,8 @@ std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const&
     TORCH_CHECK(input.scalar_type() == torch::kBFloat16, "Only bf16 input is supported");
     TORCH_CHECK(input.is_cuda(), "Input must be CUDA tensors.");
 
-    auto out = torch::empty_like(input);
     auto quant_out = torch::empty_like(input, torch::kFloat8_e4m3fn);
+    auto residual_out = torch::empty_like(residual);
 
     auto const num_tokens = input.sizes()[0];
     auto const hidden_dim = input.sizes()[1];
@@ -55,9 +54,10 @@ std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const&
 
     tensorrt_llm::kernels::invokeGeneralRmsNorm<T, QuantT>(nullptr, static_cast<T*>(input.data_ptr()),
         static_cast<T*>(norm_weight.data_ptr()), nullptr, eps, num_tokens, hidden_dim, quant_mode, stream, nullptr,
-        static_cast<float*>(scale.data_ptr()), nullptr, nullptr, static_cast<QuantT*>(quant_out.mutable_data_ptr()));
+        static_cast<float*>(scale.data_ptr()), nullptr, nullptr, static_cast<QuantT*>(quant_out.mutable_data_ptr()),
+        static_cast<T*>(residual.data_ptr()), static_cast<T*>(residual_out.mutable_data_ptr()), true);
 
-    return {quant_out, out};
+    return {quant_out, residual_out};
 }
 
 } // namespace torch_ext
@@ -65,7 +65,7 @@ std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const&
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "rms_norm_quant_fp8(Tensor input, Tensor norm_weight, "
+        "rms_norm_quant_fp8(Tensor input, Tensor residual, Tensor norm_weight, "
         "float eps, Tensor scale) -> (Tensor, Tensor)");
 }
 

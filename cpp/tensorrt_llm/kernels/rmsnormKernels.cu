@@ -53,7 +53,8 @@ __inline__ __device__ Tf compute_rmsnorm(Tf val, float s_variance, T const* gamm
 template <typename T, typename QuantT, bool USE_SHMEM>
 __global__ void generalRmsNorm(T const* input, T const* gamma, T const* beta, T* normed_output, float const eps,
     int tokens, int hidden_dim, float const* clampPtr, float const* scale_orig_quant_per_tensor,
-    float* scale_orig_quant_per_token, float* sum_per_token, QuantT* normed_output_quant, bool hasFp8MinScaling)
+    float* scale_orig_quant_per_token, float* sum_per_token, QuantT* normed_output_quant, T const* residual,
+    T* residual_out, bool const invert_per_tensor_scale, bool hasFp8MinScaling)
 {
     constexpr auto num_elems_T = num_elems<T>::value;
     // using int8_packed_t = typename packed_as<int8_t, num_elems_T>::type;
@@ -84,9 +85,18 @@ __global__ void generalRmsNorm(T const* input, T const* gamma, T const* beta, T*
     float local_var_sum = 0.0f;
 
     int const n_elems = hidden_dim / num_elems_T;
+    bool const residual_add = residual != nullptr;
     for (int i = tidx; i < n_elems; i += blockDim.x)
     {
-        T const val = input[bidx * n_elems + i];
+        int const index = bidx * n_elems + i;
+        T val = input[index];
+
+        if (residual_add)
+        {
+            val = val + residual[index];
+            residual_out[index] = val;
+        }
+
         if (USE_SHMEM)
         {
             shmem[i] = val;
@@ -112,15 +122,17 @@ __global__ void generalRmsNorm(T const* input, T const* gamma, T const* beta, T*
     bool const with_per_tensor_scaling = scale_orig_quant_per_tensor != nullptr;
     bool const with_per_token_sum = sum_per_token != nullptr;
 
-    float_packed_t const scale_orig_quant
-        = cuda_cast<float_packed_t>(with_per_tensor_scaling ? (1.0f / *scale_orig_quant_per_tensor) : 0.0f);
+    float_packed_t const scale_orig_quant = cuda_cast<float_packed_t>(with_per_tensor_scaling
+            ? (invert_per_tensor_scale ? (1.0f / *scale_orig_quant_per_tensor) : *scale_orig_quant_per_tensor)
+            : 0.0f);
     T_scalar amax = 1e-6f;
     float local_sum = 0.f;
 
     for (int i = tidx; i < n_elems; i += blockDim.x)
     {
         int const index = bidx * n_elems + i;
-        float_packed_t const val_f = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : input[index]);
+        float_packed_t const val_f
+            = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : (residual_add ? residual_out[index] : input[index]));
         T val = cuda_cast<T>(compute_rmsnorm(val_f, s_variance, gamma, beta, i));
 
         if (with_per_token_scaling)
@@ -157,7 +169,8 @@ __global__ void generalRmsNorm(T const* input, T const* gamma, T const* beta, T*
         for (int i = tidx; i < n_elems; i += blockDim.x)
         {
             int const index = bidx * n_elems + i;
-            float_packed_t val_f = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : input[index]);
+            float_packed_t val_f
+                = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : (residual_add ? residual_out[index] : input[index]));
             if (!USE_SHMEM)
             {
                 val_f = compute_rmsnorm(val_f, s_variance, gamma, beta, i);
@@ -188,8 +201,9 @@ __global__ void generalRmsNorm(T const* input, T const* gamma, T const* beta, T*
 template <typename T, typename QuantT>
 void dispatch_rmsnorm_type_square_method(T const* input, T const* gamma, T const* beta, T* normed_output,
     float const eps, int tokens, int hidden_dim, float const* clampPtr, float const* scale_orig_quant_per_tensor,
-    float* scale_orig_quant_per_token, float* sum_per_token, QuantT* normed_output_quant, bool const hasFp8MinScaling,
-    dim3 const grid, dim3 const block, size_t const shmem_size, cudaStream_t stream)
+    float* scale_orig_quant_per_token, float* sum_per_token, QuantT* normed_output_quant, T const* residual,
+    T* residual_out, bool const invert_per_tensor_scale, bool const hasFp8MinScaling, dim3 const grid, dim3 const block,
+    size_t const shmem_size, cudaStream_t stream)
 {
     // Do we use shared memory to cache intermediate results.
     bool use_shmem = true;
@@ -205,31 +219,33 @@ void dispatch_rmsnorm_type_square_method(T const* input, T const* gamma, T const
     {
         generalRmsNorm<T, QuantT, true><<<grid, block, shmem_size, stream>>>(input, gamma, beta, normed_output, eps,
             tokens, hidden_dim, clampPtr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
-            normed_output_quant, hasFp8MinScaling);
+            normed_output_quant, residual, residual_out, invert_per_tensor_scale, hasFp8MinScaling);
     }
     else
     {
         generalRmsNorm<T, QuantT, false><<<grid, block, shmem_size, stream>>>(input, gamma, beta, normed_output, eps,
             tokens, hidden_dim, clampPtr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
-            normed_output_quant, hasFp8MinScaling);
+            normed_output_quant, residual, residual_out, invert_per_tensor_scale, hasFp8MinScaling);
     }
 }
 
 template <typename T, typename QuantT>
 void dispatch_rmsnorm_type(T const* input, T const* gamma, T const* beta, T* normed_output, float const eps, int tokens,
     int hidden_dim, float const* clampPtr, float const* scale_orig_quant_per_tensor, float* scale_orig_quant_per_token,
-    float* sum_per_token, QuantT* normed_output_quant, bool const hasFp8MinScaling, dim3 const grid, dim3 const block,
+    float* sum_per_token, QuantT* normed_output_quant, T const* residual, T* residual_out,
+    bool const invert_per_tensor_scale, bool const hasFp8MinScaling, dim3 const grid, dim3 const block,
     size_t const shmem_size, cudaStream_t stream)
 {
     dispatch_rmsnorm_type_square_method(input, gamma, beta, normed_output, eps, tokens, hidden_dim, clampPtr,
-        scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token, normed_output_quant, hasFp8MinScaling,
-        grid, block, shmem_size, stream);
+        scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token, normed_output_quant, residual,
+        residual_out, invert_per_tensor_scale, hasFp8MinScaling, grid, block, shmem_size, stream);
 }
 
 template <typename T, typename QuantT>
 void invokeGeneralRmsNorm(T* out, T const* input, T const* gamma, T const* beta, float const eps, int const tokens,
     int const hidden_dim, QuantMode quantMode, cudaStream_t stream, float const* clampPtr, float const* scale,
-    float* dynamic_scale, float* sum_per_token, QuantT* normed_output_quant)
+    float* dynamic_scale, float* sum_per_token, QuantT* normed_output_quant, T const* residual, T* residual_out,
+    bool const invert_per_tensor_scale)
 {
     dim3 grid(tokens);
     dim3 block(min(hidden_dim, 1024));
@@ -253,19 +269,23 @@ void invokeGeneralRmsNorm(T* out, T const* input, T const* gamma, T const* beta,
         using Tp = typename packed_as<T, vec_size>::type;
         dispatch_rmsnorm_type(reinterpret_cast<Tp const*>(input), reinterpret_cast<Tp const*>(gamma),
             reinterpret_cast<Tp const*>(beta), reinterpret_cast<Tp*>(out), eps, tokens, hidden_dim, clampPtr, scale,
-            dynamic_scale, sum_per_token, normed_output_quant, hasFp8MinScaling, grid, block, shmem_size, stream);
+            dynamic_scale, sum_per_token, normed_output_quant, reinterpret_cast<Tp const*>(residual),
+            reinterpret_cast<Tp*>(residual_out), invert_per_tensor_scale, hasFp8MinScaling, grid, block, shmem_size,
+            stream);
     }
     else
     {
         dispatch_rmsnorm_type(input, gamma, beta, out, eps, tokens, hidden_dim, clampPtr, scale, dynamic_scale,
-            sum_per_token, normed_output_quant, hasFp8MinScaling, grid, block, shmem_size, stream);
+            sum_per_token, normed_output_quant, residual, residual_out, invert_per_tensor_scale, hasFp8MinScaling, grid,
+            block, shmem_size, stream);
     }
 }
 
 #define INSTANTIATE_GENERAL_RMSNORM(T, QuantT)                                                                         \
     template void invokeGeneralRmsNorm(T* out, const T* input, const T* gamma, const T* beta, const float eps,         \
         const int tokens, const int hidden_dim, QuantMode quantMode, cudaStream_t stream, float const* clampPtr,       \
-        const float* scale, float* dynamic_scale, float* sum_per_token, QuantT* normed_output_quant);
+        const float* scale, float* dynamic_scale, float* sum_per_token, QuantT* normed_output_quant,                   \
+        T const* residual, T* residual_out, bool const invert_per_tensor_scale);
 
 INSTANTIATE_GENERAL_RMSNORM(float, int8_t);
 INSTANTIATE_GENERAL_RMSNORM(half, int8_t);
