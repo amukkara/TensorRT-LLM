@@ -113,7 +113,7 @@ __global__ void generalRmsNorm(T const* input, T const* gamma, T const* beta, T*
     bool const with_per_token_sum = sum_per_token != nullptr;
 
     float_packed_t const scale_orig_quant
-        = cuda_cast<float_packed_t>(with_per_tensor_scaling ? *scale_orig_quant_per_tensor : 0.0f);
+        = cuda_cast<float_packed_t>(with_per_tensor_scaling ? (1.0f / *scale_orig_quant_per_tensor) : 0.0f);
     T_scalar amax = 1e-6f;
     float local_sum = 0.f;
 

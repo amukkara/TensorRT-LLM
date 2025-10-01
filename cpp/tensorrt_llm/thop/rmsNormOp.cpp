@@ -32,20 +32,8 @@
 namespace torch_ext
 {
 
-#if 0
-template <typename T, typename QuantT>
-void invokeGeneralRmsNorm(T* out, T const* input, T const* gamma, T const* beta, float const eps, int const tokens,
-    int const hidden_dim, QuantMode quantMode, cudaStream_t stream, float const* clampPtr, float const* scale,
-    float* dynamic_scale, float* sum_per_token, QuantT* normed_output_quant)
-
-else if (inputDesc[0].type == DataType::kFLOAT && mOutputType == DataType::kFP8)
-    {
-        dispatchDataType<float, __nv_fp8_e4m3>(
-            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, sum_per_token, output);
-    }
-#endif
-
-std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const& input, torch::Tensor const& residual,
+std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const& input,
+    // torch::Tensor const& residual,
     torch::Tensor const& norm_weight, double const eps, torch::Tensor const& scale)
 {
     TORCH_CHECK(input.dim() == 2, "Input must be 2D tensor [batch_size, hidden_dim].");
@@ -53,8 +41,8 @@ std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const&
     TORCH_CHECK(input.scalar_type() == torch::kBFloat16, "Only bf16 input is supported");
     TORCH_CHECK(input.is_cuda(), "Input must be CUDA tensors.");
 
-    auto normed_output_quant = torch::empty_like(input, torch::kFloat8_e4m3fn);
     auto out = torch::empty_like(input);
+    auto quant_out = torch::empty_like(input, torch::kFloat8_e4m3fn);
 
     auto const num_tokens = input.sizes()[0];
     auto const hidden_dim = input.sizes()[1];
@@ -65,12 +53,11 @@ std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const&
     using T = __nv_bfloat16;
     using QuantT = __nv_fp8_e4m3;
 
-    tensorrt_llm::kernels::invokeGeneralRmsNorm<T, QuantT>(static_cast<T*>(out.mutable_data_ptr()),
-        static_cast<T*>(input.data_ptr()), static_cast<T*>(norm_weight.data_ptr()),
-        static_cast<T*>(residual.data_ptr()), eps, num_tokens, hidden_dim, quant_mode, stream, nullptr,
-        static_cast<float*>(scale.data_ptr()), nullptr, nullptr, static_cast<QuantT*>(normed_output_quant.data_ptr()));
+    tensorrt_llm::kernels::invokeGeneralRmsNorm<T, QuantT>(nullptr, static_cast<T*>(input.data_ptr()),
+        static_cast<T*>(norm_weight.data_ptr()), nullptr, eps, num_tokens, hidden_dim, quant_mode, stream, nullptr,
+        static_cast<float*>(scale.data_ptr()), nullptr, nullptr, static_cast<QuantT*>(quant_out.mutable_data_ptr()));
 
-    return {normed_output_quant, out};
+    return {quant_out, out};
 }
 
 } // namespace torch_ext
@@ -78,7 +65,7 @@ std::tuple<torch::Tensor, torch::Tensor> rms_norm_quant_fp8(torch::Tensor const&
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "rms_norm_quant_fp8(Tensor input, Tensor residual, Tensor norm_weight, "
+        "rms_norm_quant_fp8(Tensor input, Tensor norm_weight, "
         "float eps, Tensor scale) -> (Tensor, Tensor)");
 }
 

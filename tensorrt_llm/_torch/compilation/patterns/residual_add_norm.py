@@ -85,14 +85,14 @@ def register_add_norm(custom_pass: PatternMatcherPass):
 
 
 def register_add_norm_quant_fp8(custom_pass: PatternMatcherPass):
-    residual_out = CallFunction(aten.add.Tensor,
-                                KeywordArg("input"),
-                                KeywordArg("residual"),
-                                _users=MULTIPLE)
+    #residual_out = CallFunction(aten.add.Tensor,
+    #                            KeywordArg("input"),
+    #                            KeywordArg("residual"),
+    #                            _users=MULTIPLE)
 
     flashinfer_norm_default = CallFunction(
         torch.ops.trtllm.flashinfer_rmsnorm.default,
-        residual_out,
+        KeywordArg("input"),  #residual_out,
         KeywordArg("norm_weight"),
         KeywordArg("eps"),
         _users=MULTIPLE)
@@ -106,12 +106,11 @@ def register_add_norm_quant_fp8(custom_pass: PatternMatcherPass):
     quant_out = CallFunction(getitem, static_quantize, 0, _users=1)
     scale = CallFunction(getitem, static_quantize, 1, _users=1)
 
-    add_norm_quant_pattern = MultiOutputPattern(
-        [quant_out, residual_out, scale])
+    add_norm_quant_pattern = MultiOutputPattern([quant_out, scale])
 
     def empty_pattern(
         input: torch.Tensor,
-        residual: torch.Tensor,
+        #residual: torch.Tensor,
         norm_weight: torch.nn.Parameter,
         eps: float,
         scale: torch.Tensor,
@@ -120,18 +119,18 @@ def register_add_norm_quant_fp8(custom_pass: PatternMatcherPass):
 
     def target_pattern(
         input: torch.Tensor,
-        residual: torch.Tensor,
+        #residual: torch.Tensor,
         norm_weight: torch.nn.Parameter,
         eps: float,
         scale: torch.Tensor,
     ):
         at = torch.ops.trtllm.rms_norm_quant_fp8.default(
             input=input,
-            residual=residual,
+            #residual=residual,
             norm_weight=norm_weight,
             eps=eps,
             scale=scale)
-        return at[0], at[1], scale
+        return at[0], scale
 
     def extra_check(match: Match) -> bool:
         return True
