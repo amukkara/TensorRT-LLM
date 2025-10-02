@@ -85,17 +85,22 @@ __global__ void generalRmsNorm(T const* input, T const* gamma, T const* beta, T*
     float local_var_sum = 0.0f;
 
     int const n_elems = hidden_dim / num_elems_T;
+
     bool const residual_add = residual != nullptr;
+    if (residual_add)
+    {
+        for (int i = tidx; i < n_elems; i += blockDim.x)
+        {
+            int const index = bidx * n_elems + i;
+            residual_out[index] = input[index] + residual[index];
+        }
+    }
+    T const* rms_input = residual_add ? residual_out : input;
+
     for (int i = tidx; i < n_elems; i += blockDim.x)
     {
         int const index = bidx * n_elems + i;
-        T val = input[index];
-
-        if (residual_add)
-        {
-            val = val + residual[index];
-            residual_out[index] = val;
-        }
+        T const val = rms_input[index];
 
         if (USE_SHMEM)
         {
@@ -131,8 +136,7 @@ __global__ void generalRmsNorm(T const* input, T const* gamma, T const* beta, T*
     for (int i = tidx; i < n_elems; i += blockDim.x)
     {
         int const index = bidx * n_elems + i;
-        float_packed_t const val_f
-            = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : (residual_add ? residual_out[index] : input[index]));
+        float_packed_t const val_f = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : rms_input[index]);
         T val = cuda_cast<T>(compute_rmsnorm(val_f, s_variance, gamma, beta, i));
 
         if (with_per_token_scaling)
@@ -169,8 +173,7 @@ __global__ void generalRmsNorm(T const* input, T const* gamma, T const* beta, T*
         for (int i = tidx; i < n_elems; i += blockDim.x)
         {
             int const index = bidx * n_elems + i;
-            float_packed_t val_f
-                = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : (residual_add ? residual_out[index] : input[index]));
+            float_packed_t val_f = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : rms_input[index]);
             if (!USE_SHMEM)
             {
                 val_f = compute_rmsnorm(val_f, s_variance, gamma, beta, i);
