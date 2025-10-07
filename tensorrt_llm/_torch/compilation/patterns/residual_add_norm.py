@@ -118,6 +118,7 @@ def register_add_norm_quant_fp8(custom_pass: PatternMatcherPass):
             norm_weight=norm_weight,
             eps=eps,
             scale=scale)
+        # quant_out, residual, scale
         return at[0], at[1], scale
 
     def extra_check(match: Match) -> bool:

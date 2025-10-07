@@ -503,14 +503,28 @@ def _register_fake():
             sz, dtype=torch.int32), router_logits.new_empty(sz,
                                                             dtype=torch.float32)
 
+    '''
+    @torch.library.custom_op("trtllm::rms_norm_quant_fp8",
+                             mutates_args=("residual", ))
+    def rms_norm_quant_fp8(
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        scale: torch.Tensor,
+        ) -> torch.Tensor:
+        pass
+    #  @rms_norm_quant_fp8.register_fake
+    '''
+
     @torch.library.register_fake("trtllm::rms_norm_quant_fp8")
     def _(
-        input,
-        residual,
-        norm_weight,
-        eps,
-        scale,
-    ):
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        scale: torch.Tensor,
+    ) -> (torch.Tensor, torch.Tensor):
         quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
         residual_out = torch.empty_like(residual)
         return [quant_out, residual_out]
