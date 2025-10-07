@@ -6,8 +6,7 @@ from concurrent.futures import ProcessPoolExecutor
 import modeling_qwen  # noqa
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CapacitySchedulerPolicy, SchedulerConfig,
-                                 TorchCompileConfig)
+from tensorrt_llm.llmapi import TorchCompileConfig
 
 
 def warmup(llm, prompt_ids, sampling_params):
@@ -82,7 +81,8 @@ def main():
     batch_size = 32
 
     llm = LLM(
-        model='Qwen2.5-0.5B-Instruct-FP8',
+        model=
+        '/home/amukkara/scratch/datasets/trt-llm/hf_models/Qwen/Qwen2.5-0.5B-Instruct-FP8',
         print_iter_log=True,
         disable_overlap_scheduler=True,
         max_batch_size=batch_size,
@@ -91,8 +91,8 @@ def main():
             enable_fullgraph=True,
             enable_inductor=True,
             enable_piecewise_cuda_graph=False),
-        scheduler_config=SchedulerConfig(
-            capacity_scheduler_policy=CapacitySchedulerPolicy.STATIC_BATCH))
+        batch_wait_timeout_ms=40,
+    )
 
     sampling_params = SamplingParams(max_tokens=1, return_context_logits=True)
 
