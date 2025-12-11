@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from transformers import Qwen3Config
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -18,7 +20,8 @@ from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model
+from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
+                             register_auto_model)
 
 
 class Qwen3Attention(QKNormRoPEAttention):
@@ -223,3 +226,52 @@ class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
             Qwen3Model(model_config),
             model_config,
         )
+
+
+@register_auto_model("Qwen3Embedding")
+class Qwen3Embedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Qwen3Config],
+    ):
+        super().__init__(Qwen3Model(model_config),
+                         config=model_config,
+                         hidden_size=model_config.pretrained_config.hidden_size,
+                         vocab_size=model_config.pretrained_config.vocab_size)
+
+        nn.Module.__init__(self)
+        self.model_config = model_config
+        self.model = Qwen3Model(model_config)
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        mrope_config: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        assert attn_metadata.seq_lens is not None
+        hidden_states = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            mrope_config=mrope_config,
+        )
+
+        # get hidden states of last token of each batch item
+        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+        hidden_states = hidden_states[end_indices]
+
+        return hidden_states
+
+    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
+        new_weights = {}
+        for name in weights.keys():
+            new_name = 'model.' + name
+            new_weights[new_name] = weights[name]
+        super().load_weights(new_weights, weight_mapper)
