@@ -16,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
                                                          load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
+from tensorrt_llm.bindings.executor import ModelType as ModelTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
                                           MoeLoadBalancerConfig)
@@ -127,6 +128,8 @@ class ModelConfig(Generic[TConfig]):
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
 
+    model_type: ModelTypeCpp = ModelTypeCpp.DECODER_ONLY
+
     def __setattr__(self, key, value):
         """
         Prevent modification of frozen instance attributes.
@@ -145,11 +148,8 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
-        if self.pretrained_config and hasattr(self.pretrained_config,
-                                              "architectures"):
-            self.is_generation = self.is_generation_model(
-                self.pretrained_config.architectures,
-                mm_encoder_only=self.mm_encoder_only)
+        self.is_generation = not (self.model_type == ModelTypeCpp.ENCODER_ONLY
+                                  or self.mm_encoder_only)
 
         def get_all_reduce_strategy(strategy: str = "AUTO"):
             maps = {
@@ -211,23 +211,6 @@ class ModelConfig(Generic[TConfig]):
             return self.per_layer_quant_configs[name]
 
         raise ValueError(f'quant config of {name} is not found')
-
-    @staticmethod
-    def is_generation_model(model_architectures: Optional[List[str]],
-                            mm_encoder_only: bool = False) -> bool:
-        if model_architectures is None:
-            logger.warning(
-                "Model architectures is None, default to is_generation_model=True"
-            )
-            return True
-        if mm_encoder_only:
-            return False
-        return model_architectures[0] not in [
-            "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
-            "Qwen2ForRewardModel", "LlamaForTextEmbedding", "Qwen3Embedding"
-        ]
-        # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
-        # once ModelType is used in pytorch flow.
 
     @staticmethod
     def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
@@ -412,7 +395,13 @@ class ModelConfig(Generic[TConfig]):
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
-                if pretrained_config.architectures[
+                if pretrained_config.architectures[0] in [
+                        "BertForSequenceClassification",
+                        "Qwen2ForProcessRewardModel", "Qwen2ForRewardModel",
+                        "LlamaForTextEmbedding", "Qwen3Embedding"
+                ]:
+                    kwargs['model_type'] = ModelTypeCpp.ENCODER_ONLY
+                elif pretrained_config.architectures[
                         0] == "DeepseekV32ForCausalLM":
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
