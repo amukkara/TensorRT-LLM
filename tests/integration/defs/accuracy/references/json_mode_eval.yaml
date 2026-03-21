@@ -27,3 +27,7 @@ GPT-OSS/120B-MXFP4:
   - quant_algo: W4A8_MXFP4_MXFP8
     spec_dec_algo: Eagle3
     accuracy: 62.00
+Qwen/Qwen3-4B:
+  - accuracy: 76.00
+  - spec_dec_algo: Eagle3
+    accuracy: 76.00
