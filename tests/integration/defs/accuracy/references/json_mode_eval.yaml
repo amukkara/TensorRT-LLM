@@ -31,3 +31,10 @@ Qwen/Qwen3-4B:
   - accuracy: 76.00
   - spec_dec_algo: Eagle3
     accuracy: 76.00
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 76.00
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: Eagle3
+    accuracy: 76.00

@@ -69,21 +69,33 @@ class JsonModeEval(Evaluator):
                 "guided_decoding": GuidedDecodingParams(json=schema)
             }
             yield sample["prompt"], sampling_args, sample["completion"], sample[
-                "schema"]
+                "schema"], sample["prompt"]
 
     def compute_score(self, outputs: List[RequestOutput], references: List[str],
-                      schemas: List[str]) -> float:
+                      schemas: List[str], prompts: List) -> float:
         all_corrections, all_grammar_corrections = [], []
-        for output, ref, schema in zip(outputs, references, schemas):
+        for i, (output, ref, schema,
+                prompt) in enumerate(zip(outputs, references, schemas,
+                                         prompts)):
             try:
                 output_json = json.loads(output.outputs[0].text)
                 jsonschema.validate(output_json, json.loads(schema))
             except (json.JSONDecodeError, jsonschema.ValidationError):
                 all_corrections.append(False)
                 all_grammar_corrections.append(False)
+                logger.info(f"Incorrect response #{i} (parse/schema error)\n"
+                            f"  Prompt:   {json.dumps(prompt)}\n"
+                            f"  Expected: {ref}\n"
+                            f"  Actual:   {output.outputs[0].text!r}")
                 continue
-            all_corrections.append(output_json == json.loads(ref))
+            correct = output_json == json.loads(ref)
+            all_corrections.append(correct)
             all_grammar_corrections.append(True)
+            if not correct:
+                logger.info(f"Incorrect response #{i}\n"
+                            f"  Prompt:   {json.dumps(prompt)}\n"
+                            f"  Expected: {ref}\n"
+                            f"  Actual:   {output.outputs[0].text!r}")
 
         acc = np.mean(all_corrections) * 100
         logger.info(
