@@ -150,6 +150,16 @@ class DiffusionRemoteClient:
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
 
+        # In-process opt-in: run worker in a background thread of the main
+        # process instead of spawning a subprocess. Required for tools that
+        # don't follow mp.spawn well (e.g. Nsight Compute under
+        # TreeLauncherSubreaper). Only supported for n_workers == 1.
+        self._inproc = ext is None and os.environ.get("TLLM_VISUAL_GEN_INPROC") == "1"
+        if self._inproc and self.n_workers != 1:
+            raise RuntimeError(
+                f"TLLM_VISUAL_GEN_INPROC=1 requires n_workers=1, got {self.n_workers}"
+            )
+
         if ext is None:
             # Single-node: coordinator spawns all workers locally
             # Setup distributed env
@@ -214,7 +224,27 @@ class DiffusionRemoteClient:
         self.worker_processes = []
         self._ext_worker_thread: Optional[threading.Thread] = None
 
-        if ext is None:
+        if self._inproc:
+            logger.info("DiffusionClient: Launching worker in-process (TLLM_VISUAL_GEN_INPROC=1)")
+            self._ext_worker_thread = threading.Thread(
+                target=run_diffusion_worker,
+                kwargs={
+                    "rank": 0,
+                    "world_size": 1,
+                    "master_addr": self.master_addr,
+                    "master_port": self.master_port,
+                    "request_queue_addr": self.req_addr_connect,
+                    "response_queue_addr": self.resp_addr_connect,
+                    "visual_gen_args": self.args,
+                    "req_hmac_key": self.req_hmac_key,
+                    "resp_hmac_key": self.resp_hmac_key,
+                    "log_level": logger.level,
+                    "local_rank": 0,
+                },
+                daemon=True,
+            )
+            self._ext_worker_thread.start()
+        elif ext is None:
             logger.info(f"DiffusionClient: Launching {self.n_workers} workers")
             ctx = mp.get_context("spawn")
             for rank in range(self.n_workers):
