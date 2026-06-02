@@ -186,6 +186,15 @@ class DiffusionExecutor:
 
     def serve_forever(self):
         """Main execution loop."""
+        # Env-gated torch.profiler hook: capture a single request and export a
+        # Chrome trace. Set TLLM_VISUAL_GEN_TORCH_PROFILE_TRACE=<path> before
+        # constructing VisualGen; the env is inherited by spawned workers.
+        # TLLM_VISUAL_GEN_TORCH_PROFILE_SKIP (default 1) skips that many
+        # requests before profiling — leave at 1 so warmup compile/autotune
+        # does not pollute the trace.
+        profile_trace_path = os.environ.get("TLLM_VISUAL_GEN_TORCH_PROFILE_TRACE")
+        profile_skip = int(os.environ.get("TLLM_VISUAL_GEN_TORCH_PROFILE_SKIP", "1"))
+        request_count = 0
         while True:
             req = None
             if self.rank == 0:
@@ -205,7 +214,30 @@ class DiffusionExecutor:
                 break
 
             logger.info(f"Worker {self.device_id}: Processing request {req.request_id}")
-            self.process_request(req)
+            should_profile = profile_trace_path is not None and request_count == profile_skip
+            if should_profile:
+                logger.info(
+                    f"Worker {self.device_id}: torch.profiler capturing request "
+                    f"{req.request_id} -> {profile_trace_path}"
+                )
+                with torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=True,
+                ) as prof:
+                    self.process_request(req)
+                    torch.cuda.synchronize()
+                rank_path = profile_trace_path
+                if dist.get_world_size() > 1:
+                    base, ext = os.path.splitext(profile_trace_path)
+                    rank_path = f"{base}.rank{self.rank}{ext}"
+                prof.export_chrome_trace(rank_path)
+                logger.info(f"Worker {self.device_id}: trace written to {rank_path}")
+            else:
+                self.process_request(req)
+            request_count += 1
 
     def _merge_defaults(self, req: DiffusionRequest):
         """Fill ``None`` fields in *req.params* with pipeline-specific defaults.
