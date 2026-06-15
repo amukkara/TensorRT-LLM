@@ -450,4 +450,5 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         )
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights, weight_mapper)

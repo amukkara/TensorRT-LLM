@@ -3,6 +3,7 @@ from torch import nn
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 @register_mapper("HF", "Gemma3ForCausalLM")
@@ -26,6 +27,17 @@ class Gemma3HfWeightMapper(HfWeightMapper):
 
         return any(skip_module in module_name
                    for skip_module in self._skip_modules)
+
+    def preprocess_weights(self, weights: dict) -> dict:
+        # compressed-tensors FP8 rowwise stores weight_scale as [out, 1];
+        # FP8RowwiseLinearMethod's weight_scale parameter is 1-D [out].
+        if self.config.quant_config.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
+            weights = {
+                k: (v.squeeze(-1) if k.endswith(".weight_scale") and v.ndim == 2
+                    and v.shape[1] == 1 else v)
+                for k, v in weights.items()
+            }
+        return weights
 
     def handle_manual_copy(self,
                            module_name: str,
