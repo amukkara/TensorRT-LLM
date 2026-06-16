@@ -63,37 +63,27 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         return normalized_weights
 
     def _normalize_scale_names(self, weights: dict, quant_algo) -> tuple[dict, bool]:
-        # Canonicalize FP8 weight_scale layout so the Linear loader sees one
-        # shape per quant algo:
-        #   - FP8_BLOCK_SCALES: modelopt fp8_pb_wo stores weight_scale shaped
-        #     [blocks_out, 1, blocks_in, 1]; squeeze to [blocks_out, blocks_in]
-        #     and rename to weight_scale_inv. Returns is_modelopt_pb_wo=True
-        #     so the caller can keep modelopt's native FP8 path.
-        #   - FP8_PER_CHANNEL_PER_TOKEN: compressed-tensors stores weight_scale
-        #     shaped [out, 1]; squeeze to 1-D [out].
+        # Canonicalize modelopt's FP8 block-scale layout (fp8_pb_wo): stored as
+        # [blocks_out, 1, blocks_in, 1]; squeeze to [blocks_out, blocks_in] and
+        # rename to weight_scale_inv so downstream packing and linear-attn
+        # dequant can detect 2D-block scales by suffix alone. Returns
+        # is_modelopt_pb_wo=True so the caller keeps modelopt's native FP8 path.
+        # FP8_PER_CHANNEL_PER_TOKEN (compressed-tensors) is handled centrally
+        # in _load_weights_impl_v2 via canonicalize_compressed_tensors_weights.
 
         is_modelopt_pb_wo = False
-        if quant_algo not in (QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN):
+        if quant_algo != QuantAlgo.FP8_BLOCK_SCALES:
             return weights, is_modelopt_pb_wo
 
         remapped_weights = {}
         for key, tensor in weights.items():
-            if key.endswith(".weight_scale"):
-                if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and tensor.ndim == 4:
-                    assert tensor.shape[1] == 1 and tensor.shape[-1] == 1, (
-                        f"Expected scale shape [*, 1, *, 1] for {key}, got {tuple(tensor.shape)}"
-                    )
-                    tensor = tensor.squeeze(1).squeeze(-1)
-                    # Rename so downstream packing and linear-attn dequant can
-                    # detect 2D-block scales by suffix alone.
-                    key = key[: -len("weight_scale")] + "weight_scale_inv"
-                    is_modelopt_pb_wo = True
-                elif (
-                    quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-                    and tensor.ndim == 2
-                    and tensor.shape[1] == 1
-                ):
-                    tensor = tensor.squeeze(-1)
+            if key.endswith(".weight_scale") and tensor.ndim == 4:
+                assert tensor.shape[1] == 1 and tensor.shape[-1] == 1, (
+                    f"Expected scale shape [*, 1, *, 1] for {key}, got {tuple(tensor.shape)}"
+                )
+                tensor = tensor.squeeze(1).squeeze(-1)
+                key = key[: -len("weight_scale")] + "weight_scale_inv"
+                is_modelopt_pb_wo = True
             if key in remapped_weights:
                 raise ValueError(f"Duplicate remapped key found: {key}")
             remapped_weights[key] = tensor

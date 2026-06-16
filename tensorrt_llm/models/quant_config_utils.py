@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Mapping
+from typing import Any, Dict, Mapping
+
+import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -96,3 +98,25 @@ def update_quant_config_from_compressed_tensors(
         )
     else:
         quant_config.exclude_modules = hf_quant_config.get("ignore", [])
+
+
+def canonicalize_compressed_tensors_weights(
+    weights: Dict[str, torch.Tensor], quant_config: QuantConfig
+) -> Dict[str, torch.Tensor]:
+    """Normalize llm-compressor compressed-tensors scale layouts.
+
+    Maps llm-compressor's storage to what TRT-LLM's Linear/MoE loaders expect.
+    Currently handles FP8 per-channel per-token (rowwise): compressed-tensors
+    stores weight_scale as [out, 1] while FP8RowwiseLinearMethod expects a
+    1-D [out] parameter. Idempotent on already-canonical tensors.
+    """
+    if quant_config.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
+        return {
+            k: (
+                v.squeeze(-1)
+                if k.endswith(".weight_scale") and v.ndim == 2 and v.shape[1] == 1
+                else v
+            )
+            for k, v in weights.items()
+        }
+    return weights

@@ -838,7 +838,7 @@ def get_model_architecture(
             model_config.architectures) > 0:
         cls = MODEL_CLASS_MAPPING.get(model_config.architectures[0])
     else:
-        raise RuntimeError(f"Model architecture is not provided.")
+        raise RuntimeError("Model architecture is not provided.")
 
     if cls is None:
         arch = model_config.architectures[0]
@@ -1116,6 +1116,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
     if params_map is not None:
         weights = weight_mapper.rename_by_params_map(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
+    # Canonicalize compressed-tensors (llm-compressor) scale layouts so the
+    # Linear/MoE loaders see one shape per quant algo, regardless of the model.
+    from tensorrt_llm.models.quant_config_utils import \
+        canonicalize_compressed_tensors_weights
+    weights = canonicalize_compressed_tensors_weights(
+        weights, weight_mapper.config.quant_config)
     device_id = local_mpi_rank()
 
     def load_single_module(name, module):
