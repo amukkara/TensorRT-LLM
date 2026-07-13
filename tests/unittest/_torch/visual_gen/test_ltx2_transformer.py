@@ -1094,5 +1094,133 @@ class TestLTX2CacheDiTWrapperPassthrough(unittest.TestCase):
         )
 
 
+class TestLTX2CaptionProjectionBypass(unittest.TestCase):
+    """Caption-projection bypass (LTX-2.3 caption_proj_before_connector).
+
+    When caption_projection_first_linear/second_linear are both False the
+    in-transformer caption projection becomes nn.Identity — the embeddings
+    connector already emits inner_dim-sized context. Defaults (both True, LTX-2)
+    keep the PixArtAlphaTextProjection.
+    """
+
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def test_default_keeps_pixart_projection(self):
+        import torch.nn as nn
+
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.text_projection import (
+            PixArtAlphaTextProjection,
+        )
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+
+        model = LTXModel(
+            model_type=LTXModelType.AudioVideo,
+            model_config=_create_model_config(),
+            **AUDIO_VIDEO_CONFIG,
+        )
+        self.assertIsInstance(model.caption_projection, PixArtAlphaTextProjection)
+        self.assertIsInstance(model.audio_caption_projection, PixArtAlphaTextProjection)
+        self.assertNotIsInstance(model.caption_projection, nn.Identity)
+
+    def test_both_flags_false_uses_identity(self):
+        import torch.nn as nn
+
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+
+        model = LTXModel(
+            model_type=LTXModelType.AudioVideo,
+            model_config=_create_model_config(),
+            caption_projection_first_linear=False,
+            caption_projection_second_linear=False,
+            **AUDIO_VIDEO_CONFIG,
+        )
+        self.assertIsInstance(model.caption_projection, nn.Identity)
+        self.assertIsInstance(model.audio_caption_projection, nn.Identity)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_bypass_forward_sanity_inner_dim_context(self):
+        """With the bypass, context is already inner_dim-wide and forward runs."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+
+        torch.manual_seed(42)
+        dtype = torch.bfloat16
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo,
+                model_config=_create_model_config(),
+                caption_projection_first_linear=False,
+                caption_projection_second_linear=False,
+                **AUDIO_VIDEO_CONFIG,
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
+        _init_all_weights(model)
+
+        batch = 1
+        v_frames, v_h, v_w = 1, 4, 4
+        v_patches = v_frames * v_h * v_w
+        a_patches = 8
+        in_channels = AUDIO_VIDEO_CONFIG["in_channels"]
+        audio_in_channels = AUDIO_VIDEO_CONFIG["audio_in_channels"]
+        text_len = 8
+
+        # Bypass path: connector output feeds the transformer directly, so the
+        # context width is the transformer inner_dim, not caption_channels.
+        v_inner = (
+            AUDIO_VIDEO_CONFIG["num_attention_heads"] * AUDIO_VIDEO_CONFIG["attention_head_dim"]
+        )
+        a_inner = (
+            AUDIO_VIDEO_CONFIG["audio_num_attention_heads"]
+            * AUDIO_VIDEO_CONFIG["audio_attention_head_dim"]
+        )
+        v_context = torch.randn(batch, text_len, v_inner, device=self.DEVICE, dtype=dtype) * 0.02
+        a_context = torch.randn(batch, text_len, a_inner, device=self.DEVICE, dtype=dtype) * 0.02
+        v_positions = _make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE)
+        a_positions = _make_audio_positions(batch, a_patches, self.DEVICE)
+
+        video_modality = Modality(
+            latent=torch.randn(batch, v_patches, in_channels, device=self.DEVICE, dtype=dtype)
+            * 0.02,
+            timesteps=torch.tensor([0.5], device=self.DEVICE),
+            positions=v_positions,
+            context=v_context,
+        )
+        audio_modality = Modality(
+            latent=torch.randn(batch, a_patches, audio_in_channels, device=self.DEVICE, dtype=dtype)
+            * 0.02,
+            timesteps=torch.tensor([0.5], device=self.DEVICE),
+            positions=a_positions,
+            context=a_context,
+        )
+        text_cache = model.prepare_text_cache(
+            video_context=v_context,
+            video_positions=v_positions,
+            audio_context=a_context,
+            audio_positions=a_positions,
+            dtype=dtype,
+        )
+
+        with torch.no_grad():
+            video_out, audio_out = model(
+                video=video_modality, audio=audio_modality, text_cache=text_cache
+            )
+
+        self.assertEqual(video_out.shape, (batch, v_patches, AUDIO_VIDEO_CONFIG["out_channels"]))
+        self.assertEqual(
+            audio_out.shape, (batch, a_patches, AUDIO_VIDEO_CONFIG["audio_out_channels"])
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

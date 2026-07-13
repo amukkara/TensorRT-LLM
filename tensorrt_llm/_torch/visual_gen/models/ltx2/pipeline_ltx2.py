@@ -792,6 +792,8 @@ class LTX2Pipeline(BasePipeline):
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
+            caption_projection_first_linear=getattr(cfg, "caption_projection_first_linear", True),
+            caption_projection_second_linear=getattr(cfg, "caption_projection_second_linear", True),
             model_config=model_config,
         )
         self.transformer._transformer_config = vars(cfg)
@@ -974,7 +976,9 @@ class LTX2Pipeline(BasePipeline):
             )
             self.feature_extractor = self.feature_extractor.to(device=device, dtype=dtype)
 
-            self.video_connector = Embeddings1DConnectorConfigurator.from_config(config)
+            self.video_connector = Embeddings1DConnectorConfigurator.from_config(
+                config, modality="video"
+            )
             _load_component_weights(
                 sft_paths,
                 self.video_connector,
@@ -982,7 +986,9 @@ class LTX2Pipeline(BasePipeline):
             )
             self.video_connector = self.video_connector.to(device=device, dtype=dtype)
 
-            self.audio_connector = Embeddings1DConnectorConfigurator.from_config(config)
+            self.audio_connector = Embeddings1DConnectorConfigurator.from_config(
+                config, modality="audio"
+            )
             _load_component_weights(
                 sft_paths,
                 self.audio_connector,
@@ -1199,8 +1205,13 @@ class LTX2Pipeline(BasePipeline):
         additive_mask = additive_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, S]
 
         projected = self.feature_extractor(prompt_embeds)
-        video_embeds, video_mask = self.video_connector(projected, additive_mask)
-        audio_embeds, _ = self.audio_connector(projected, additive_mask)
+        if getattr(self.feature_extractor, "split", False):
+            # LTX-2.3: per-modality projections; LTX-2: one shared projection.
+            video_projected, audio_projected = projected
+        else:
+            video_projected = audio_projected = projected
+        video_embeds, video_mask = self.video_connector(video_projected, additive_mask)
+        audio_embeds, _ = self.audio_connector(audio_projected, additive_mask)
 
         return video_embeds, audio_embeds, video_mask
 

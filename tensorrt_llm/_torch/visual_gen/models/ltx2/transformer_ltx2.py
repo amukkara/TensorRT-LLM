@@ -1497,6 +1497,8 @@ class LTXModel(BaseDiffusionModel):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
+        caption_projection_first_linear: bool = True,
+        caption_projection_second_linear: bool = True,
         model_config: Optional["DiffusionModelConfig"] = None,
     ):
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -1509,6 +1511,9 @@ class LTXModel(BaseDiffusionModel):
         self.double_precision_rope = double_precision_rope
         self.timestep_scale_multiplier = timestep_scale_multiplier
         self.positional_embedding_theta = positional_embedding_theta
+        # Consumed by _init_video/_init_audio to pick the caption projection.
+        self.caption_projection_first_linear = caption_projection_first_linear
+        self.caption_projection_second_linear = caption_projection_second_linear
 
         cross_pe_max_pos = None
 
@@ -1691,17 +1696,27 @@ class LTXModel(BaseDiffusionModel):
             force_dynamic_quantization=force_dq,
         )
 
+    def _make_caption_projection(self, caption_channels, hidden_size):
+        """Caption projection, or nn.Identity when both flags are disabled.
+
+        LTX-2.3 projects per-modality before the connector, so the connector
+        already emits hidden_size-wide features and no projection is needed here.
+        """
+        if not (self.caption_projection_first_linear or self.caption_projection_second_linear):
+            return nn.Identity()
+        return PixArtAlphaTextProjection(
+            in_features=caption_channels,
+            hidden_size=hidden_size,
+            make_linear=self._make_linear,
+        )
+
     def _init_video(self, in_channels, out_channels, caption_channels, norm_eps):
         self.patchify_proj = self._make_linear(in_channels, self.inner_dim)
         self.adaln_single = AdaLayerNormSingle(
             self.inner_dim,
             make_linear=self._make_linear,
         )
-        self.caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels,
-            hidden_size=self.inner_dim,
-            make_linear=self._make_linear,
-        )
+        self.caption_projection = self._make_caption_projection(caption_channels, self.inner_dim)
         self.scale_shift_table = nn.Parameter(torch.empty(2, self.inner_dim))
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=norm_eps)
         self.proj_out = self._make_linear(self.inner_dim, out_channels)
@@ -1712,10 +1727,8 @@ class LTXModel(BaseDiffusionModel):
             self.audio_inner_dim,
             make_linear=self._make_linear,
         )
-        self.audio_caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels,
-            hidden_size=self.audio_inner_dim,
-            make_linear=self._make_linear,
+        self.audio_caption_projection = self._make_caption_projection(
+            caption_channels, self.audio_inner_dim
         )
         self.audio_scale_shift_table = nn.Parameter(torch.empty(2, self.audio_inner_dim))
         self.audio_norm_out = nn.LayerNorm(

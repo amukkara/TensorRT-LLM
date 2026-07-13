@@ -167,12 +167,30 @@ class Embeddings1DConnector(torch.nn.Module):
 
 class Embeddings1DConnectorConfigurator:
     @classmethod
-    def from_config(cls, config: dict) -> Embeddings1DConnector:
+    def from_config(cls, config: dict, modality: str = "video") -> Embeddings1DConnector:
+        """Build a per-modality connector from the embedded checkpoint config.
+
+        Audio reads ``audio_connector_*`` keys, falling back to shared
+        ``connector_*`` keys; video reads ``connector_*``.
+        Defaults reproduce LTX-2 (2 layers, 30 heads, head_dim 128, no gating).
+        """
         config = config.get("transformer", {})
         rope_type = LTXRopeType(config.get("rope_type", "interleaved"))
         double_precision_rope = config.get("frequencies_precision", False) == "float64"
         pe_max_pos = config.get("connector_positional_embedding_max_pos", [1])
+
+        def pick(suffix, default):
+            if modality == "audio":
+                return config.get(
+                    f"audio_connector_{suffix}", config.get(f"connector_{suffix}", default)
+                )
+            return config.get(f"connector_{suffix}", default)
+
         return Embeddings1DConnector(
+            num_layers=pick("num_layers", 2),
+            num_attention_heads=pick("num_attention_heads", 30),
+            attention_head_dim=pick("attention_head_dim", 128),
+            num_learnable_registers=pick("num_learnable_registers", 128),
             positional_embedding_max_pos=pe_max_pos,
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
@@ -181,15 +199,47 @@ class Embeddings1DConnectorConfigurator:
 
 
 class GemmaFeaturesExtractorProjLinear(torch.nn.Module):
-    """Linear projection for Gemma feature extraction."""
+    """Aggregates the stacked Gemma hidden-state layers (fan-in 3840 * 49).
 
-    def __init__(self) -> None:
+    Selected by ``caption_proj_before_connector``:
+    LTX-2 (``split=False``) uses a single shared ``aggregate_embed`` (→3840, no
+    bias) with the per-modality projection done later inside the transformer;
+    LTX-2.3 (``split=True``) does the per-modality projection here via
+    ``video_aggregate_embed`` / ``audio_aggregate_embed`` (to each connector
+    inner dim, with bias).
+    """
+
+    IN_FEATURES = 3840 * 49
+
+    def __init__(
+        self, *, split: bool = False, video_dim: int = 4096, audio_dim: int = 2048
+    ) -> None:
         super().__init__()
-        self.aggregate_embed = torch.nn.Linear(3840 * 49, 3840, bias=False)
+        self.split = split
+        if split:
+            self.video_aggregate_embed = torch.nn.Linear(self.IN_FEATURES, video_dim, bias=True)
+            self.audio_aggregate_embed = torch.nn.Linear(self.IN_FEATURES, audio_dim, bias=True)
+        else:
+            self.aggregate_embed = torch.nn.Linear(self.IN_FEATURES, 3840, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
+        if self.split:
+            return self.video_aggregate_embed(x), self.audio_aggregate_embed(x)
         return self.aggregate_embed(x)
 
     @classmethod
-    def from_config(cls, _config: dict) -> "GemmaFeaturesExtractorProjLinear":
-        return cls()
+    def from_config(cls, config: dict) -> "GemmaFeaturesExtractorProjLinear":
+        t = config.get("transformer", {})
+        if not t.get("caption_proj_before_connector", False):
+            return cls(split=False)
+        # Project to each connector's inner dim (heads * head_dim).
+        video_dim = t.get("connector_num_attention_heads", 32) * t.get(
+            "connector_attention_head_dim", 128
+        )
+        audio_heads = t.get(
+            "audio_connector_num_attention_heads", t.get("connector_num_attention_heads", 32)
+        )
+        audio_head_dim = t.get(
+            "audio_connector_attention_head_dim", t.get("connector_attention_head_dim", 64)
+        )
+        return cls(split=True, video_dim=video_dim, audio_dim=audio_heads * audio_head_dim)
