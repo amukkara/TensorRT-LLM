@@ -5,24 +5,75 @@
 from ..normalization import NormType
 from .audio_vae import AudioDecoder
 from .causality_axis import CausalityAxis
-from .vocoder import Vocoder
+from .vocoder import MelSTFT, Vocoder, VocoderWithBWE
+
+
+def _vocoder_from_config(
+    cfg: dict,
+    apply_final_activation: bool = True,
+    output_sample_rate: int | None = None,
+) -> Vocoder:
+    """Build a plain Vocoder from a flat config sub-dict."""
+    return Vocoder(
+        resblock_kernel_sizes=cfg.get("resblock_kernel_sizes", [3, 7, 11]),
+        upsample_rates=cfg.get("upsample_rates", [6, 5, 2, 2, 2]),
+        upsample_kernel_sizes=cfg.get("upsample_kernel_sizes", [16, 15, 8, 4, 4]),
+        resblock_dilation_sizes=cfg.get(
+            "resblock_dilation_sizes", [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
+        ),
+        upsample_initial_channel=cfg.get("upsample_initial_channel", 1024),
+        stereo=cfg.get("stereo", True),
+        resblock=cfg.get("resblock", "1"),
+        output_sample_rate=(
+            output_sample_rate
+            if output_sample_rate is not None
+            else cfg.get("output_sampling_rate", cfg.get("output_sample_rate", 24000))
+        ),
+        activation=cfg.get("activation", "snake"),
+        use_tanh_at_final=cfg.get("use_tanh_at_final", True),
+        apply_final_activation=apply_final_activation,
+        use_bias_at_final=cfg.get("use_bias_at_final", True),
+    )
 
 
 class VocoderConfigurator:
+    """Build the vocoder, auto-detecting the checkpoint format.
+
+    LTX-2 has a flat ``vocoder`` config (HiFi-GAN) -> plain ``Vocoder``.
+    LTX-2.3 nests ``vocoder`` + ``bwe`` sub-dicts (BigVGAN-v2 + bandwidth
+    extension) -> ``VocoderWithBWE``.
+    """
+
     @classmethod
-    def from_config(cls, config: dict) -> Vocoder:
-        config = config.get("vocoder", {})
-        return Vocoder(
-            resblock_kernel_sizes=config.get("resblock_kernel_sizes", [3, 7, 11]),
-            upsample_rates=config.get("upsample_rates", [6, 5, 2, 2, 2]),
-            upsample_kernel_sizes=config.get("upsample_kernel_sizes", [16, 15, 8, 4, 4]),
-            resblock_dilation_sizes=config.get(
-                "resblock_dilation_sizes", [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
-            ),
-            upsample_initial_channel=config.get("upsample_initial_channel", 1024),
-            stereo=config.get("stereo", True),
-            resblock=config.get("resblock", "1"),
-            output_sample_rate=config.get("output_sample_rate", 24000),
+    def from_config(cls, config: dict) -> Vocoder | VocoderWithBWE:
+        cfg = config.get("vocoder", {})
+        if "bwe" not in cfg:
+            return _vocoder_from_config(cfg)
+
+        vocoder_cfg = cfg.get("vocoder", {})
+        bwe_cfg = cfg["bwe"]
+        vocoder = _vocoder_from_config(
+            vocoder_cfg,
+            output_sample_rate=bwe_cfg["input_sampling_rate"],
+        )
+        bwe_generator = _vocoder_from_config(
+            bwe_cfg,
+            apply_final_activation=False,
+            output_sample_rate=bwe_cfg["output_sampling_rate"],
+        )
+        mel_stft = MelSTFT(
+            filter_length=bwe_cfg["n_fft"],
+            hop_length=bwe_cfg["hop_length"],
+            win_length=bwe_cfg["n_fft"],
+            n_mel_channels=bwe_cfg["num_mels"],
+        )
+        return VocoderWithBWE(
+            vocoder=vocoder,
+            bwe_generator=bwe_generator,
+            mel_stft=mel_stft,
+            input_sampling_rate=bwe_cfg["input_sampling_rate"],
+            output_sampling_rate=bwe_cfg["output_sampling_rate"],
+            hop_length=bwe_cfg["hop_length"],
         )
 
 

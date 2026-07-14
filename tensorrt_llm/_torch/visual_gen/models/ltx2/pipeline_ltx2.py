@@ -1059,6 +1059,11 @@ class LTX2Pipeline(BasePipeline):
             self.audio_sampling_rate = self.audio_decoder.sample_rate
             self.audio_hop_length = self.audio_decoder.mel_hop_length
             self.audio_mel_bins = self.audio_decoder.mel_bins
+            # The LTX-2.3 bandwidth-extension vocoder resamples to a higher rate
+            # (e.g. 48 kHz), overriding the decoder's mel sample rate.
+            bwe_rate = getattr(getattr(self, "vocoder", None), "output_sampling_rate", None)
+            if bwe_rate is not None:
+                self.audio_sampling_rate = bwe_rate
 
         # Transformer patch config
         t_cfg = self.transformer._transformer_config

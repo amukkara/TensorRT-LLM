@@ -5,7 +5,7 @@
 from .audio_vae import AudioDecoder, decode_audio
 from .model_configurator import AudioDecoderConfigurator, VocoderConfigurator
 from .ops import PerChannelStatistics
-from .vocoder import Vocoder
+from .vocoder import Vocoder, VocoderWithBWE
 
 __all__ = [
     "AudioDecoder",
@@ -13,5 +13,6 @@ __all__ = [
     "PerChannelStatistics",
     "Vocoder",
     "VocoderConfigurator",
+    "VocoderWithBWE",
     "decode_audio",
 ]
