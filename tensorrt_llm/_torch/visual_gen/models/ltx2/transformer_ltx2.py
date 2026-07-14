@@ -40,7 +40,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .ltx2_core.adaln import AdaLayerNormSingle
+from .ltx2_core.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from .ltx2_core.modality import Modality
 from .ltx2_core.perturbations import BatchedPerturbationConfig, PerturbationType
 from .ltx2_core.rope import LTXRopeType, apply_rotary_emb
@@ -560,6 +560,7 @@ class TransformerConfig:
     d_head: int
     context_dim: int
     apply_gated_attention: bool = False
+    text_cross_attn_adaln: bool = False
 
 
 class AudioShardMode(Enum):
@@ -681,7 +682,11 @@ class BasicAVTransformerBlock(nn.Module):
             enable_sequence_parallel=False,
         )
         self.ff = self._make_mlp(cfg, model_config, idx)
-        self.scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
+        num_ada = adaln_embedding_coefficient(cfg.text_cross_attn_adaln)
+        self.scale_shift_table = nn.Parameter(torch.empty(num_ada, cfg.dim))
+        if cfg.text_cross_attn_adaln:
+            # shift/scale for the text cross-attn context (K/V), modulated by prompt_timestep.
+            self.prompt_scale_shift_table = nn.Parameter(torch.empty(2, cfg.dim))
 
     def _init_audio_modules(self, cfg, rope_type, eps, model_config, idx):
         # audio_attn1 needs key_padding_mask (audio is padded to divide ulysses_size; the
@@ -723,7 +728,10 @@ class BasicAVTransformerBlock(nn.Module):
             enable_sequence_parallel=False,
         )
         self.audio_ff = self._make_mlp(cfg, model_config, idx)
-        self.audio_scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
+        num_ada = adaln_embedding_coefficient(cfg.text_cross_attn_adaln)
+        self.audio_scale_shift_table = nn.Parameter(torch.empty(num_ada, cfg.dim))
+        if cfg.text_cross_attn_adaln:
+            self.audio_prompt_scale_shift_table = nn.Parameter(torch.empty(2, cfg.dim))
 
     def _init_av_cross_modules(self, v_cfg, a_cfg, rope_type, eps, model_config, idx):
         self.audio_to_video_attn = LTX2Attention(
@@ -1497,6 +1505,7 @@ class LTXModel(BaseDiffusionModel):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
+        text_cross_attn_adaln: bool = False,
         caption_projection_first_linear: bool = True,
         caption_projection_second_linear: bool = True,
         model_config: Optional["DiffusionModelConfig"] = None,
@@ -1514,6 +1523,8 @@ class LTXModel(BaseDiffusionModel):
         # Consumed by _init_video/_init_audio to pick the caption projection.
         self.caption_projection_first_linear = caption_projection_first_linear
         self.caption_projection_second_linear = caption_projection_second_linear
+        # LTX-2.3: text cross-attn AdaLN (9-slot tables + prompt modulation).
+        self.text_cross_attn_adaln = text_cross_attn_adaln
 
         cross_pe_max_pos = None
 
@@ -1597,6 +1608,7 @@ class LTXModel(BaseDiffusionModel):
             audio_cross_attention_dim=audio_cross_attention_dim,
             norm_eps=norm_eps,
             apply_gated_attention=apply_gated_attention,
+            text_cross_attn_adaln=text_cross_attn_adaln,
         )
 
         self.__post_init__()
@@ -1714,8 +1726,16 @@ class LTXModel(BaseDiffusionModel):
         self.patchify_proj = self._make_linear(in_channels, self.inner_dim)
         self.adaln_single = AdaLayerNormSingle(
             self.inner_dim,
+            embedding_coefficient=adaln_embedding_coefficient(self.text_cross_attn_adaln),
             make_linear=self._make_linear,
         )
+        if self.text_cross_attn_adaln:
+            # Produces prompt_timestep (shift/scale for the text context) from sigma.
+            self.prompt_adaln_single = AdaLayerNormSingle(
+                self.inner_dim,
+                embedding_coefficient=2,
+                make_linear=self._make_linear,
+            )
         self.caption_projection = self._make_caption_projection(caption_channels, self.inner_dim)
         self.scale_shift_table = nn.Parameter(torch.empty(2, self.inner_dim))
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=norm_eps)
@@ -1725,8 +1745,15 @@ class LTXModel(BaseDiffusionModel):
         self.audio_patchify_proj = self._make_linear(in_channels, self.audio_inner_dim)
         self.audio_adaln_single = AdaLayerNormSingle(
             self.audio_inner_dim,
+            embedding_coefficient=adaln_embedding_coefficient(self.text_cross_attn_adaln),
             make_linear=self._make_linear,
         )
+        if self.text_cross_attn_adaln:
+            self.audio_prompt_adaln_single = AdaLayerNormSingle(
+                self.audio_inner_dim,
+                embedding_coefficient=2,
+                make_linear=self._make_linear,
+            )
         self.audio_caption_projection = self._make_caption_projection(
             caption_channels, self.audio_inner_dim
         )
@@ -1838,6 +1865,7 @@ class LTXModel(BaseDiffusionModel):
         audio_cross_attention_dim,
         norm_eps,
         apply_gated_attention,
+        text_cross_attn_adaln,
     ):
         video_config = (
             TransformerConfig(
@@ -1846,6 +1874,7 @@ class LTXModel(BaseDiffusionModel):
                 d_head=attention_head_dim,
                 context_dim=cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
+                text_cross_attn_adaln=text_cross_attn_adaln,
             )
             if self.model_type.is_video_enabled()
             else None
@@ -1857,6 +1886,7 @@ class LTXModel(BaseDiffusionModel):
                 d_head=audio_attention_head_dim,
                 context_dim=audio_cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
+                text_cross_attn_adaln=text_cross_attn_adaln,
             )
             if self.model_type.is_audio_enabled()
             else None

@@ -1222,5 +1222,63 @@ class TestLTX2CaptionProjectionBypass(unittest.TestCase):
         )
 
 
+class TestLTX2CrossAttentionAdaLNSizing(unittest.TestCase):
+    """Phase 1 of LTX-2.3 AdaLN: config-driven slot count + prompt modules.
+
+    text_cross_attn_adaln grows the per-block scale_shift tables 6->9 and the
+    model-level adaln_single 6->9, and adds the prompt_scale_shift tables and
+    prompt_adaln_single modules. Default (LTX-2) stays 6-wide with no prompt
+    params.
+    """
+
+    def _build(self, text_cross_attn_adaln):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+
+        return LTXModel(
+            model_type=LTXModelType.AudioVideo,
+            model_config=_create_model_config(),
+            text_cross_attn_adaln=text_cross_attn_adaln,
+            **AUDIO_VIDEO_CONFIG,
+        )
+
+    def test_default_six_slots_no_prompt_params(self):
+        model = self._build(text_cross_attn_adaln=False)
+        v_dim = AUDIO_VIDEO_CONFIG["num_attention_heads"] * AUDIO_VIDEO_CONFIG["attention_head_dim"]
+        a_dim = (
+            AUDIO_VIDEO_CONFIG["audio_num_attention_heads"]
+            * AUDIO_VIDEO_CONFIG["audio_attention_head_dim"]
+        )
+        block = model.transformer_blocks[0]
+        self.assertEqual(tuple(block.scale_shift_table.shape), (6, v_dim))
+        self.assertEqual(tuple(block.audio_scale_shift_table.shape), (6, a_dim))
+        self.assertEqual(model.adaln_single.linear.out_features, 6 * v_dim)
+        self.assertEqual(model.audio_adaln_single.linear.out_features, 6 * a_dim)
+        self.assertFalse(hasattr(block, "prompt_scale_shift_table"))
+        self.assertFalse(hasattr(model, "prompt_adaln_single"))
+        self.assertFalse(hasattr(model, "audio_prompt_adaln_single"))
+
+    def test_text_cross_attn_adaln_nine_slots_and_prompt_params(self):
+        model = self._build(text_cross_attn_adaln=True)
+        v_dim = AUDIO_VIDEO_CONFIG["num_attention_heads"] * AUDIO_VIDEO_CONFIG["attention_head_dim"]
+        a_dim = (
+            AUDIO_VIDEO_CONFIG["audio_num_attention_heads"]
+            * AUDIO_VIDEO_CONFIG["audio_attention_head_dim"]
+        )
+        block = model.transformer_blocks[0]
+        # 9-slot AdaLN tables + matching model-level projections.
+        self.assertEqual(tuple(block.scale_shift_table.shape), (9, v_dim))
+        self.assertEqual(tuple(block.audio_scale_shift_table.shape), (9, a_dim))
+        self.assertEqual(model.adaln_single.linear.out_features, 9 * v_dim)
+        self.assertEqual(model.audio_adaln_single.linear.out_features, 9 * a_dim)
+        # New prompt (context K/V) modulation params.
+        self.assertEqual(tuple(block.prompt_scale_shift_table.shape), (2, v_dim))
+        self.assertEqual(tuple(block.audio_prompt_scale_shift_table.shape), (2, a_dim))
+        self.assertEqual(model.prompt_adaln_single.linear.out_features, 2 * v_dim)
+        self.assertEqual(model.audio_prompt_adaln_single.linear.out_features, 2 * a_dim)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

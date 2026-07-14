@@ -792,6 +792,7 @@ class LTX2Pipeline(BasePipeline):
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
+            text_cross_attn_adaln=getattr(cfg, "cross_attention_adaln", False),
             caption_projection_first_linear=getattr(cfg, "caption_projection_first_linear", True),
             caption_projection_second_linear=getattr(cfg, "caption_projection_second_linear", True),
             model_config=model_config,

@@ -8,6 +8,16 @@ import torch
 
 from .timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
 
+# Per-block AdaLN slot count. Base: shift/scale/gate for self-attn + FF (6);
+# text_cross_attn_adaln adds shift/scale/gate for the text cross-attn norm (+3).
+ADALN_NUM_BASE_PARAMS = 6
+ADALN_NUM_CROSS_ATTN_PARAMS = 3
+
+
+def adaln_embedding_coefficient(text_cross_attn_adaln: bool) -> int:
+    """Total number of AdaLN modulation slots per transformer block."""
+    return ADALN_NUM_BASE_PARAMS + (ADALN_NUM_CROSS_ATTN_PARAMS if text_cross_attn_adaln else 0)
+
 
 class AdaLayerNormSingle(torch.nn.Module):
     """Adaptive layer norm (adaLN-single) from PixArt-Alpha.
