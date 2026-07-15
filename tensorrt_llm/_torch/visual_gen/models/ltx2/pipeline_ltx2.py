@@ -1111,8 +1111,13 @@ class LTX2Pipeline(BasePipeline):
         padding_side: str = "left",
         scale_factor: int = 8,
         eps: float = 1e-6,
+        norm_type: str = "min_max",
     ) -> torch.Tensor:
-        """Pack and normalize text encoder hidden states."""
+        """Pack and normalize text encoder hidden states.
+
+        LTX-2 (``min_max``) mean-centers then scales by the masked min-max range.
+        LTX-2.3 (``per_token_rms``) applies per-token RMSNorm over the hidden dim.
+        """
         batch_size, seq_len, hidden_dim, num_layers = text_hidden_states.shape
         original_dtype = text_hidden_states.dtype
 
@@ -1126,17 +1131,25 @@ class LTX2Pipeline(BasePipeline):
             raise ValueError(f"padding_side must be 'left' or 'right', got {padding_side}")
         mask = mask[:, :, None, None]
 
-        masked_text_hidden_states = text_hidden_states.masked_fill(~mask, 0.0)
-        num_valid_positions = (sequence_lengths * hidden_dim).view(batch_size, 1, 1, 1)
-        masked_mean = masked_text_hidden_states.sum(dim=(1, 2), keepdim=True) / (
-            num_valid_positions + eps
-        )
-
-        x_min = text_hidden_states.masked_fill(~mask, float("inf")).amin(dim=(1, 2), keepdim=True)
-        x_max = text_hidden_states.masked_fill(~mask, float("-inf")).amax(dim=(1, 2), keepdim=True)
-
-        normalized_hidden_states = (text_hidden_states - masked_mean) / (x_max - x_min + eps)
-        normalized_hidden_states = normalized_hidden_states * scale_factor
+        if norm_type == "per_token_rms":
+            variance = text_hidden_states.pow(2).mean(dim=2, keepdim=True)
+            normalized_hidden_states = text_hidden_states * torch.rsqrt(variance + eps)
+        elif norm_type == "min_max":
+            masked_text_hidden_states = text_hidden_states.masked_fill(~mask, 0.0)
+            num_valid_positions = (sequence_lengths * hidden_dim).view(batch_size, 1, 1, 1)
+            masked_mean = masked_text_hidden_states.sum(dim=(1, 2), keepdim=True) / (
+                num_valid_positions + eps
+            )
+            x_min = text_hidden_states.masked_fill(~mask, float("inf")).amin(
+                dim=(1, 2), keepdim=True
+            )
+            x_max = text_hidden_states.masked_fill(~mask, float("-inf")).amax(
+                dim=(1, 2), keepdim=True
+            )
+            normalized_hidden_states = (text_hidden_states - masked_mean) / (x_max - x_min + eps)
+            normalized_hidden_states = normalized_hidden_states * scale_factor
+        else:
+            raise ValueError(f"Unknown text_encoder_norm_type: {norm_type!r}")
 
         normalized_hidden_states = normalized_hidden_states.flatten(2)
         mask_flat = mask.squeeze(-1).expand(-1, -1, hidden_dim * num_layers)
@@ -1176,12 +1189,17 @@ class LTX2Pipeline(BasePipeline):
         text_encoder_hidden_states = torch.stack(text_encoder_hidden_states, dim=-1)
         sequence_lengths = prompt_attention_mask.sum(dim=-1)
 
+        # LTX-2 uses min-max; LTX-2.3 declares per_token_rms in its config.
+        norm_type = self._native_config.get("transformer", {}).get(
+            "text_encoder_norm_type", "min_max"
+        )
         prompt_embeds = self._pack_text_embeds(
             text_encoder_hidden_states,
             sequence_lengths,
             device=self.device,
             padding_side=self.tokenizer.padding_side,
             scale_factor=scale_factor,
+            norm_type=norm_type,
         )
         prompt_embeds = prompt_embeds.to(dtype=self.dtype)
 

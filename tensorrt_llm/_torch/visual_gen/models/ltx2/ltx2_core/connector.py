@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
 
+import math
+
 import torch
 
 from .attention import Attention, FeedForward
@@ -209,7 +211,9 @@ class GemmaFeaturesExtractorProjLinear(torch.nn.Module):
     inner dim, with bias).
     """
 
-    IN_FEATURES = 3840 * 49
+    # Gemma hidden size; the stacked-layer fan-in is EMBEDDING_DIM * num_layers.
+    EMBEDDING_DIM = 3840
+    IN_FEATURES = EMBEDDING_DIM * 49
 
     def __init__(
         self, *, split: bool = False, video_dim: int = 4096, audio_dim: int = 2048
@@ -222,9 +226,19 @@ class GemmaFeaturesExtractorProjLinear(torch.nn.Module):
         else:
             self.aggregate_embed = torch.nn.Linear(self.IN_FEATURES, 3840, bias=False)
 
+    def _rescale(self, x: torch.Tensor, out_features: int) -> torch.Tensor:
+        # LTX-2.3: rescale the per-token-RMS features by sqrt(out/in) per projection.
+        return x * math.sqrt(out_features / self.EMBEDDING_DIM)
+
     def forward(self, x: torch.Tensor):
         if self.split:
-            return self.video_aggregate_embed(x), self.audio_aggregate_embed(x)
+            video = self.video_aggregate_embed(
+                self._rescale(x, self.video_aggregate_embed.out_features)
+            )
+            audio = self.audio_aggregate_embed(
+                self._rescale(x, self.audio_aggregate_embed.out_features)
+            )
+            return video, audio
         return self.aggregate_embed(x)
 
     @classmethod
