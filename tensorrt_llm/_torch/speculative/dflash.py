@@ -41,6 +41,7 @@ from .dflash_attention import (
     get_dflash_paged_append,
     validate_dflash_fa4_runtime,
     validate_dflash_trtllm_gen_runtime,
+    validate_dflash_xqa_runtime,
 )
 from .interface import SpecMetadata, SpecWorkerBase
 from .spec_tail_kernels import (
@@ -53,7 +54,7 @@ from .vocab_parallel import VocabParallelHead, VocabShardedLogits
 
 # Backends that keep the draft's private context K/V in a paged HND pool.
 # They share the pool layout, page table and paged append op
-_PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4")
+_PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4", "XQA")
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
@@ -1577,6 +1578,9 @@ class DFlashWorker(SpecWorkerBase):
                     tokens_per_block=page_size,
                     has_context_attention=has_context_attention,
                 )
+            elif self._dflash_attention_backend == "XQA":
+                draft_model.validate_block_attention_windows()
+                validate_dflash_xqa_runtime(dtype=dtype, head_dim=hd)
             elif self._dflash_attention_backend == "FA4":
                 validate_dflash_fa4_runtime(dtype=dtype, head_dim=hd)
             # Settle the block table before committing to the pool: it is the
