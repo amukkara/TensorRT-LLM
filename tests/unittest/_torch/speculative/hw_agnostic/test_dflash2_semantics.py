@@ -652,6 +652,20 @@ def test_trtllm_backend_accepts_causal_or_unwindowed_layers():
     ).validate_block_attention_windows()
 
 
+def test_xqa_backend_needs_the_whole_block_on_non_causal_layers():
+    """XQA drops the window's right bound, so a non-causal layer may only run
+    there when its right-hand window already covers the whole block."""
+    wrapper = _mask_wrapper(_all_sliding_config(2048), backend="XQA")
+    wrapper.block_size = 16
+    wrapper.validate_block_attention_windows()
+
+    config = SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2)
+    wrapper = _mask_wrapper(config, backend="XQA", layer_windows=[(3, 3), (3, 3)])
+    wrapper.block_size = 16
+    with pytest.raises(ValueError, match="draft layer 0 configures 3"):
+        wrapper.validate_block_attention_windows()
+
+
 def test_trtllm_window_check_reads_the_use_swa_override():
     """A use_swa window replaces the checkpoint-inferred one in the block
     decode, so the check must resolve the same window the forward uses."""

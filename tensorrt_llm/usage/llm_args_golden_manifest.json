@@ -1563,7 +1563,8 @@
         "TRTLLM",
         "FA4",
         "AUTO",
-        "CUTEDSL"
+        "CUTEDSL",
+        "XQA"
       ],
       "capture_policy": "literal",
       "kind": "categorical",

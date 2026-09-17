@@ -25,6 +25,7 @@ from ..speculative.dflash_attention import (
     get_dflash_flash_attention,
     get_dflash_paged_append,
     get_dflash_trtllm_gen_ops,
+    get_dflash_xqa_decode,
 )
 from ..speculative.interface import SpeculativeDecodingMode
 from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
@@ -336,7 +337,7 @@ class DFlashForCausalLM(nn.Module):
     # sets were built for, while an MLA drafter runs its own block decode and
     # has a third implementation they cannot express.
     _default_attention_backend = "VANILLA"
-    _supported_attention_backends = ("VANILLA", "TRTLLM", "FA4")
+    _supported_attention_backends = ("VANILLA", "TRTLLM", "FA4", "XQA")
     # Where AUTO lands when the preferred backend cannot run. None means AUTO
     # propagates the reason instead: a family whose only deployable target can
     # run the fast kernel gains nothing from a silently slower path.
@@ -470,6 +471,7 @@ class DFlashForCausalLM(nn.Module):
         self._dflash_flash_attention = None
         self._dflash_trtllm_gen_ops = None
         self._dflash_fa4_fwd = None
+        self._dflash_xqa_decode = None
         self._dflash_paged_append = None
         if not self._uses_worker_attention_backend:
             # Still validated above so a typo fails here rather than silently,
@@ -487,6 +489,9 @@ class DFlashForCausalLM(nn.Module):
         elif self.dflash_attention_backend == "FA4":
             self._dflash_fa4_fwd = get_dflash_fa4_fwd()
             self._dflash_paged_append = get_dflash_paged_append()
+        elif self.dflash_attention_backend == "XQA":
+            self._dflash_xqa_decode = get_dflash_xqa_decode()
+            self._dflash_paged_append = get_dflash_paged_append()
         else:
             # Not the user's typo -- check_valid_attention_backend rejected
             # those above. This is a subclass that widened
@@ -499,6 +504,8 @@ class DFlashForCausalLM(nn.Module):
             )
         self._dflash_trtllm_gen_workspace = None
         self._dflash_trtllm_gen_counters = None
+        self._dflash_xqa_workspace = None
+        self._dflash_xqa_masks = {}
         self.register_buffer("_dflash_batch_indices", None, persistent=False)
         self.register_buffer("_dflash_block_offsets", None, persistent=False)
         self._dflash_trtllm_gen_device = None
@@ -1310,20 +1317,29 @@ class DFlashForCausalLM(nn.Module):
         return causal, window_size
 
     def validate_block_attention_windows(self) -> None:
-        """Refuse windows the TRTLLM block-decode kernel cannot apply.
+        """Refuse windows the TRTLLM or XQA block-decode kernel cannot apply.
 
         TRTLLM-Gen only implements sliding windows for causal masks: flashinfer
         rejects ``causal=False`` with any finite ``window_left`` outright. A
         non-causal windowed layer must therefore run on VANILLA or FA4, which
-        take a two-sided window.
+        take a two-sided window. XQA drops the window's right bound, so a
+        non-causal layer must see the whole block.
         """
-        if self.dflash_attention_backend != "TRTLLM":
+        if self.dflash_attention_backend not in ("TRTLLM", "XQA"):
             return
         num_layers = getattr(self.config, "num_hidden_layers", None)
         if num_layers is None:
             num_layers = len(self.model.layers)
         for layer_idx in range(num_layers):
-            causal, (window_left, _) = self._resolve_block_attention(layer_idx)
+            causal, (window_left, window_right) = self._resolve_block_attention(layer_idx)
+            if self.dflash_attention_backend == "XQA":
+                if causal or not 0 <= window_right < self.block_size - 1:
+                    continue
+                raise ValueError(
+                    "DFlash XQA attention needs a right-hand window of at least "
+                    f"block_size - 1 ({self.block_size - 1}) on non-causal layers, "
+                    f"but draft layer {layer_idx} configures {window_right}."
+                )
             if causal or window_left < 0:
                 continue
             raise ValueError(
@@ -1448,6 +1464,33 @@ class DFlashForCausalLM(nn.Module):
                 .contiguous()
             )
 
+    def _prepare_dflash_xqa_buffers(
+        self,
+        device: torch.device,
+        max_batch_size: int,
+        block_size: int,
+    ) -> None:
+        """Allocate XQA's workspace and the two draft masks.
+
+        The mask is bit-packed: row i carries the draft columns it may read,
+        which is the whole block on a non-causal layer and a prefix otherwise.
+        """
+        if self._dflash_xqa_workspace is not None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("DFlash XQA buffers must be allocated before CUDA graph capture.")
+        # XQA reserves the first 8 MiB for semaphores and uses the rest as scratch.
+        self._dflash_xqa_workspace = torch.zeros(64 << 20, dtype=torch.uint8, device=device)
+        row_bits = (block_size + 31) // 32 * 32
+        weights = 1 << torch.arange(16, dtype=torch.int32, device=device)
+        full = torch.ones(block_size, block_size, dtype=torch.int32, device=device)
+        for causal, rows in ((False, full), (True, full.tril())):
+            bits = torch.nn.functional.pad(rows, (0, row_bits - block_size))
+            words = (bits.view(block_size, -1, 16) * weights).sum(-1)
+            self._dflash_xqa_masks[causal] = (
+                words.to(torch.uint16).expand(max_batch_size, -1, -1).contiguous()
+            )
+
     def dflash_forward(
         self,
         noise_embedding: torch.Tensor,
@@ -1473,7 +1516,7 @@ class DFlashForCausalLM(nn.Module):
         Returns:
             [B * block_size, hidden_size]
         """
-        is_paged = self.dflash_attention_backend in ("TRTLLM", "FA4")
+        is_paged = self.dflash_attention_backend in ("TRTLLM", "FA4", "XQA")
         if is_paged:
             if ctx_kv_cache is None or ctx_page_table is None:
                 raise RuntimeError(
@@ -1487,7 +1530,7 @@ class DFlashForCausalLM(nn.Module):
             flash_attention = self._dflash_flash_attention
         else:
             raise ValueError(
-                "DFlash attention backend must be VANILLA, TRTLLM or FA4, got "
+                "DFlash attention backend must be VANILLA, TRTLLM, FA4 or XQA, got "
                 f"{self.dflash_attention_backend!r}."
             )
 
@@ -1540,8 +1583,12 @@ class DFlashForCausalLM(nn.Module):
                     num_kv_heads_per_rank,
                     head_dim,
                 )
-            else:  # FA4 needs no workspace or counter buffers.
+            else:  # FA4 and XQA share the private arena's index buffers.
                 self._prepare_dflash_index_buffers(hidden_states.device, max_batch_size, block_size)
+                if self.dflash_attention_backend == "XQA":
+                    self._prepare_dflash_xqa_buffers(
+                        hidden_states.device, max_batch_size, block_size
+                    )
             block_tables = ctx_page_table.index_select(0, cache_batch_idx_i32.long())
             pages_per_slot = block_tables.size(1)
             # Index the layer first: ctx_kv_cache is an [L, ...] tensor for the
@@ -1762,7 +1809,7 @@ class DFlashForCausalLM(nn.Module):
                         causal=False,
                         multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
                     )
-            elif self.dflash_attention_backend == "FA4":
+            elif self.dflash_attention_backend in ("FA4", "XQA"):
                 layer_cache = ctx_kv_cache[layer_idx]
                 paged_append(
                     append_key=k_noise_bshd.reshape(
@@ -1779,27 +1826,45 @@ class DFlashForCausalLM(nn.Module):
                     kv_last_page_len=kv_last_page_len,
                     kv_layout="HND",
                 )
-                # FA4 wants NHD pages, [pages, page_size, nkv, hd]. Pool is
-                # HND so transpose: stride(-1) == 1, so no copy is materialized.
-                k_pages = layer_cache[:, 0].transpose(1, 2)
-                v_pages = layer_cache[:, 1].transpose(1, 2)
-                window_left, window_right = window_size
-                # pack_gqa=None lets FA4 enable packing itself whenever
-                # q_heads > kv_heads, including on windowed layers.
-                out, *_ = fa4_fwd(
-                    Q_bshd,
-                    k_pages,
-                    v_pages,
-                    seqused_k=seq_lens_after,
-                    page_table=block_tables,
-                    softmax_scale=head_dim**-0.5,
-                    causal=causal,
-                    window_size_left=None if window_left < 0 else window_left,
-                    window_size_right=None if window_right < 0 else window_right,
-                    num_splits=1,  # SM90 has no SplitKV kernel
-                    pack_gqa=None,
-                    return_lse=False,
-                )
+                if self.dflash_attention_backend == "FA4":
+                    # FA4 wants NHD pages, [pages, page_size, nkv, hd]. Pool is
+                    # HND so transpose: stride(-1) == 1, so no copy is materialized.
+                    k_pages = layer_cache[:, 0].transpose(1, 2)
+                    v_pages = layer_cache[:, 1].transpose(1, 2)
+                    window_left, window_right = window_size
+                    # pack_gqa=None lets FA4 enable packing itself whenever
+                    # q_heads > kv_heads, including on windowed layers.
+                    out, *_ = fa4_fwd(
+                        Q_bshd,
+                        k_pages,
+                        v_pages,
+                        seqused_k=seq_lens_after,
+                        page_table=block_tables,
+                        softmax_scale=head_dim**-0.5,
+                        causal=causal,
+                        window_size_left=None if window_left < 0 else window_left,
+                        window_size_right=None if window_right < 0 else window_right,
+                        num_splits=1,  # SM90 has no SplitKV kernel
+                        pack_gqa=None,
+                        return_lse=False,
+                    )
+                else:
+                    out = self._dflash_xqa_decode(
+                        query=Q_bshd.reshape(
+                            B * block_size, num_heads_per_rank, head_dim
+                        ).contiguous(),
+                        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+                        workspace_buffer=self._dflash_xqa_workspace,
+                        block_tables=block_tables,
+                        seq_lens=seq_lens_after,
+                        max_seq_len=pages_per_slot * page_size,
+                        bmm1_scale=head_dim**-0.5,
+                        bmm2_scale=1.0,
+                        window_left=window_size[0],
+                        kv_layout="HND",
+                        q_len_per_req=block_size,
+                        mask=self._dflash_xqa_masks[causal][:B],
+                    )
             else:  # VANILLA, validated before entering the layer loop.
                 # Store this layer's block K/V, then attend read-only.
                 kv_row_shape = (-1, num_kv_heads_per_rank, head_dim)
