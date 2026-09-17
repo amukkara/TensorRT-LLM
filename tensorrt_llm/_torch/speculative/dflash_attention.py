@@ -103,6 +103,50 @@ def validate_dflash_fa4_runtime(
         raise RuntimeError(f"DFlash FA4 attention does not support head_dim={head_dim} on SM90.")
 
 
+@lru_cache(maxsize=1)
+def get_dflash_xqa_decode() -> Callable[..., torch.Tensor]:
+    """Load flashinfer's XQA batch decode."""
+    if not IS_FLASHINFER_AVAILABLE:
+        raise RuntimeError("DFlash XQA attention requires flashinfer, which is not installed.")
+    try:
+        from flashinfer.decode import xqa_batch_decode_with_kv_cache
+    except ImportError as error:
+        raise RuntimeError(
+            "DFlash XQA attention requires a flashinfer build exposing "
+            "flashinfer.decode.xqa_batch_decode_with_kv_cache."
+        ) from error
+    return xqa_batch_decode_with_kv_cache
+
+
+def validate_dflash_xqa_runtime(
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+    num_heads: int,
+    num_kv_heads: int,
+) -> None:
+    """Fail before cache allocation when DFlash's shape is unsupported by XQA."""
+    get_dflash_xqa_decode()
+    get_dflash_paged_append()
+
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(f"DFlash XQA attention does not support activation dtype {dtype}.")
+
+    # flashinfer/xqa.py builds kernels for SM90, SM100 and SM120/SM121 only.
+    sm = get_sm_version()
+    if sm // 10 not in (9, 10, 12):
+        raise RuntimeError(
+            f"DFlash XQA attention backend requires SM90, SM100 or SM120, got SM{sm}."
+        )
+    if head_dim > 256:
+        raise RuntimeError(f"DFlash XQA attention does not support head_dim={head_dim} (max 256).")
+    if num_kv_heads == 0 or num_heads % num_kv_heads != 0:
+        raise RuntimeError(
+            "DFlash XQA attention requires num_heads to be a multiple of num_kv_heads, "
+            f"got num_heads={num_heads}, num_kv_heads={num_kv_heads}."
+        )
+
+
 def dflash_trtllm_gen_unavailability_reason() -> Optional[str]:
     """Return why the DFlash TRTLLM backend cannot be initialized, or None.
 
@@ -110,6 +154,7 @@ def dflash_trtllm_gen_unavailability_reason() -> Optional[str]:
     drafter that prefers TRTLLM has to know whether to fall back before it
     commits, and ``get_dflash_trtllm_gen_ops`` only reports by raising.
     """
+
     if not IS_FLASHINFER_AVAILABLE:
         return "flashinfer is not installed"
 

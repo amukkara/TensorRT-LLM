@@ -2974,7 +2974,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
-    attention_backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
+    attention_backend: Literal["VANILLA", "TRTLLM", "FA4", "XQA"] = Field(
         default="VANILLA",
         description=
         "Attention backend for DFlash pooled-context cross-attention, independent "
@@ -2982,7 +2982,9 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "with a contiguous context K/V cache and runs anywhere. TRTLLM uses "
         "TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache "
         "and supports SM100/SM103 only. FA4 uses the flash-attn CuTe DSL kernels "
-        "on the same paged cache and supports SM90 only.")
+        "on the same paged cache and supports SM90 only. XQA uses FlashInfer's "
+        "XQA batch decode on the same paged cache and supports SM90/SM100/SM120."
+    )
 
     skip_ctx_buffer_budget_check: bool = Field(
         default=False,
