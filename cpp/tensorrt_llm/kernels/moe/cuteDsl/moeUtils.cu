@@ -456,7 +456,7 @@ template <typename InputType, typename OutputType, typename SFType, int32_t kSFV
     int32_t kThreadsPerBlock>
 __global__ void moeActivationKernel(InputType const* input, OutputType* output, float const* global_sf,
     SFType* output_sf, int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles,
-    int32_t const interm_size, int32_t const tile_size)
+    int32_t const interm_size, int32_t const tile_size, bool const gate_first)
 {
     using ComputeType = float;
 #ifdef ENABLE_FP4
@@ -477,11 +477,13 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
 
     float global_sf_val = global_sf == nullptr ? 1.0f : global_sf[0];
 
-    int32_t const num_tokens = num_non_exiting_tiles[0] * tile_size;
+    int32_t const num_tokens = num_non_exiting_tiles == nullptr ? tile_size : num_non_exiting_tiles[0] * tile_size;
+    int64_t const linear_offset = ActFn::IS_GLU && gate_first ? kCopyPerToken : 0;
+    int64_t const gate_offset = gate_first ? 0 : kCopyPerToken;
     for (int32_t permuted_idx = blockIdx.x; permuted_idx < num_tokens; permuted_idx += gridDim.x)
     {
         int32_t const tile_idx = permuted_idx / tile_size;
-        if (permuted_idx >= tile_idx_to_mn_limit[tile_idx])
+        if (tile_idx_to_mn_limit != nullptr && permuted_idx >= tile_idx_to_mn_limit[tile_idx])
         {
             continue;
         }
@@ -490,10 +492,10 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
         auto* dst_ptr = reinterpret_cast<ElemOutputCopyType*>(output) + permuted_idx * kCopyPerToken;
         for (int32_t i = threadIdx.x; i < kCopyPerToken; i += kThreadsPerBlock)
         {
-            *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i];
+            *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i + linear_offset];
             if constexpr (ActFn::IS_GLU)
             {
-                *reinterpret_cast<ElemCopyType*>(rmemGate) = src_ptr[i + kCopyPerToken];
+                *reinterpret_cast<ElemCopyType*>(rmemGate) = src_ptr[i + gate_offset];
 #pragma unroll
                 for (int32_t j = 0; j < kElemPerCopy; j++)
                 {
@@ -536,7 +538,7 @@ template <typename InputType, typename OutputType, typename SFType>
 void moeActivation(InputType const* input, OutputType* output, float const* global_sf, SFType* output_sf,
     int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles,
     cutlass_kernels::ActivationParams activation_params, int32_t const max_num_permuted_tokens,
-    int32_t const interm_size, int32_t const tile_size, cudaStream_t stream)
+    int32_t const interm_size, int32_t const tile_size, cudaStream_t stream, bool const gate_first)
 {
     int32_t constexpr kThreadsPerBlock = 256;
     int32_t constexpr kSFVecSize = 16;
@@ -557,11 +559,12 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
     }
 #endif
 
-    auto get_act_kernel = [](ActivationType activation_type) -> void (*)(InputType const* input, OutputType* output,
-                                                                 float const* global_sf, SFType* output_sf,
-                                                                 int32_t const* tile_idx_to_mn_limit,
-                                                                 int32_t const* num_non_exiting_tiles,
-                                                                 int32_t const interm_size, int32_t const tile_size)
+    auto get_act_kernel
+        = [](ActivationType activation_type) -> void (*)(InputType const* input, OutputType* output,
+                                                 float const* global_sf, SFType* output_sf,
+                                                 int32_t const* tile_idx_to_mn_limit,
+                                                 int32_t const* num_non_exiting_tiles, int32_t const interm_size,
+                                                 int32_t const tile_size, bool const gate_first)
     {
         switch (activation_type)
         {
@@ -611,7 +614,7 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
     config.numAttrs = 1;
     config.attrs = attrs;
     cudaLaunchKernelEx(&config, kernel, input, output, global_sf, output_sf, tile_idx_to_mn_limit,
-        num_non_exiting_tiles, interm_size, tile_size);
+        num_non_exiting_tiles, interm_size, tile_size, gate_first);
 }
 
 #define INSTANTIATE_MOE_ACTIVATION(InputType, OutputType, SFType)                                                      \
@@ -619,7 +622,7 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
         float const* global_sf, SFType* output_sf, int32_t const* tile_idx_to_mn_limit,                                \
         int32_t const* num_non_exiting_tiles, cutlass_kernels::ActivationParams activation_params,                     \
         int32_t const max_num_permuted_tokens, int32_t const interm_size, int32_t const tile_size,                     \
-        cudaStream_t stream)
+        cudaStream_t stream, bool const gate_first)
 
 INSTANTIATE_MOE_ACTIVATION(half, half, uint8_t);
 #ifdef ENABLE_BF16
