@@ -229,3 +229,41 @@ def test_modelopt_fp8_excluded_linear_attention_falls_back_to_bf16() -> None:
         f"{_ATTN_PREFIX}.in_proj_z.input_scale",
     ):
         assert name not in out
+
+
+def test_modelopt_fp8_per_channel_linear_attention() -> None:
+    # ModelOpt MIXED_PRECISION export with FP8_PER_CHANNEL_PER_TOKEN in_proj_qkv / in_proj_z:
+    # 1-D per-row weight scales and no input scales. The fused in_proj_qkvz entry (synthesized by
+    # _normalize_qwen35_quant_config_dict) keeps the FP8 weights, and the per-row scales are
+    # packed with the same row order as the weights.
+    checkpoint_prefix = "model.language_model.layers.0.linear_attn"
+    qkv_rows = _Q_ROWS * 2 + _V_ROWS
+    # Distinct FP8 values per row (codes 1..48), with each row's scale equal to its value, so a
+    # packed row and its packed scale stay paired iff they were permuted together.
+    row_values = torch.arange(1, _PACKED_QKVZ_ROWS + 1, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    weights = {}
+    for name, rows in (
+        ("in_proj_qkv", row_values[:qkv_rows]),
+        ("in_proj_z", row_values[qkv_rows:]),
+    ):
+        weights[f"{checkpoint_prefix}.{name}.weight"] = (
+            rows[:, None].expand(-1, _HIDDEN).contiguous()
+        )
+        weights[f"{checkpoint_prefix}.{name}.weight_scale"] = rows.float()
+    for name in ("in_proj_b", "in_proj_a"):
+        weights[f"{checkpoint_prefix}.{name}.weight"] = _bf16(_BA_ROWS)
+
+    mapper = _make_mapper(QuantAlgo.MIXED_PRECISION)
+    mapper._config.quant_config_dict = {
+        f"{_ATTN_PREFIX}.in_proj_qkvz": QuantConfig(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+    }
+    out = mapper.preprocess_weights(weights)
+
+    packed_weight = out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"]
+    packed_scale = out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight_scale"]
+    assert packed_weight.dtype == torch.float8_e4m3fn
+    assert packed_weight.shape == (_PACKED_QKVZ_ROWS, _HIDDEN)
+    assert packed_scale.shape == (_PACKED_QKVZ_ROWS,)
+    torch.testing.assert_close(packed_weight[:, 0].float(), packed_scale)
+    assert f"{_ATTN_PREFIX}.in_proj_qkvz.input_scale" not in out
+    assert out[f"{_ATTN_PREFIX}.in_proj_ba.weight"].dtype == torch.bfloat16
