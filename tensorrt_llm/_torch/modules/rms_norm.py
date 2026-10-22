@@ -23,7 +23,9 @@ from torch import nn
 from ..._utils import get_sm_version
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..utils import Fp4QuantizedTensor, is_nvfp4_marlin_enabled
+from ..utils import (Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor,
+                     is_nvfp4_marlin_enabled)
+from .rms_norm_fp8_per_token import add_rms_norm_fp8_per_token
 
 # Hidden-dim bounds of the warp-specialized fused_add_rms_norm_quant kernel
 # (cpp/tensorrt_llm/thop/fusedAddRMSNormQuant.cpp).
@@ -110,6 +112,11 @@ class RMSNorm(nn.Module):
         # plain weight, so a gemma norm uses the fused path only once its owning
         # model has cached (1 + weight) here.
         self._fused_norm_weight: Optional[torch.Tensor] = None
+        # Set by the owning model when this norm feeds an FP8 rowwise Linear
+        # that shares its input with an unquantized one: forward then returns an
+        # Fp8PerTokenQuantizedTensor carrying both the per-token FP8 activation
+        # and the BF16/FP16 normed output.
+        self.fp8_per_token_out = False
 
     def forward(
         self,
@@ -143,6 +150,14 @@ class RMSNorm(nn.Module):
                                         or self._fused_norm_weight is not None):
             return self._fused_nvfp4_quant(hidden_states, residual, nvfp4_scale,
                                            return_norm_out)
+
+        if self.fp8_per_token_out and hidden_states.dtype in (torch.float16,
+                                                              torch.bfloat16):
+            normed, fp8, scale = add_rms_norm_fp8_per_token(
+                hidden_states, residual, self.weight, self.variance_epsilon,
+                self.use_gemma)
+            out = Fp8PerTokenQuantizedTensor(fp8, scale, normed)
+            return (out, residual) if has_residual else out
 
         if self.return_hp_output:
             raise ValueError(

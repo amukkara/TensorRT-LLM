@@ -40,9 +40,9 @@ from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, replace_parameter_and_save_metadata,
-                     unswizzle_sf)
+from ..utils import (Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor,
+                     get_model_extra_attrs, is_torch_compiling,
+                     replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 
 
@@ -1141,11 +1141,13 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # fp8_rowwise_gemm requires a 2D mat1; flatten here and unflatten the output below.
         orig_shape = input.shape
-        if input.dim() > 2:
+        if len(orig_shape) > 2:
             input = input.reshape(-1, input.shape[-1])
 
+        if isinstance(input, Fp8PerTokenQuantizedTensor):
+            qinput, cur_input_scale = input.fp8_tensor, input.per_token_scale
         # FP8 tensor inputs are from attention. Directly use ones as scale.
-        if input.dtype == torch.float8_e4m3fn:
+        elif input.dtype == torch.float8_e4m3fn:
             qinput = input
             cur_input_scale = torch.ones(input.shape[0],
                                          device=input.device,

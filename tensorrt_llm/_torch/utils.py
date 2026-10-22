@@ -230,6 +230,23 @@ class Fp4QuantizedTensor:
 
 
 @dataclass
+class Fp8PerTokenQuantizedTensor:
+    """FP8 E4M3 activation with one FP32 dequantization scale per token.
+
+    Produced by a norm fused with dynamic per-token quantization and consumed
+    by FP8 rowwise Linears. ``unquantized_hidden_states`` carries the BF16/FP16
+    normed activation for consumers of the same input that are not FP8.
+    """
+    fp8_tensor: torch.Tensor
+    per_token_scale: torch.Tensor  # [num_tokens, 1], fp32
+    unquantized_hidden_states: Optional[torch.Tensor] = None
+
+    @property
+    def shape(self):
+        return self.fp8_tensor.shape
+
+
+@dataclass
 class MxFp8QuantizedTensor:
     """MXFP8 activation and its per-1x32 UE8M0 scaling factors.
 

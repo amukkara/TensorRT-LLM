@@ -51,7 +51,8 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import (Linear, TensorParallelMode,
+from ..modules.linear import (FP8RowwiseLinearMethod, Linear,
+                              TensorParallelMode,
                               is_static_nvfp4_input_eligible)
 from ..modules.low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
@@ -1214,3 +1215,11 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                     and norm.is_nvfp4
                     and is_static_nvfp4_input_eligible(mlp.mlp.gate_up_proj)):
                 norm.nvfp4_scale = mlp.mlp.gate_up_proj.input_scale
+            # An FP8 rowwise GDN in_proj_qkvz takes its per-token FP8 input from
+            # the preceding (add +) RMSNorm, which also keeps the BF16 output
+            # for the unquantized in_proj_ba.
+            linear_attn = getattr(layer, "linear_attn", None)
+            if linear_attn is not None:
+                layer.input_layernorm.fp8_per_token_out = isinstance(
+                    linear_attn.in_proj_qkvz.quant_method,
+                    FP8RowwiseLinearMethod)
