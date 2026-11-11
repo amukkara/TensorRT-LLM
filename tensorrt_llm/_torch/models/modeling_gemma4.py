@@ -501,16 +501,22 @@ class Gemma4Attention(QKNormRoPEAttention):
     def _fused_qkv_prep_enabled(self) -> bool:
         if self._fused_qkv_prep is None:
             rot = self.rotary_emb
-            use_flashinfer_fp8 = getattr(self.attn, "flashinfer_backend", None) == "trtllm-gen"
-            use_trtllm_bf16 = self._use_trtllm_fused_qkv_prep
+            has_fp8_kv = getattr(self.attn, "has_fp8_kv_cache", False)
+            use_flashinfer_fp8 = (
+                getattr(self.attn, "flashinfer_backend", None) == "trtllm-gen" and has_fp8_kv
+            )
             self._fused_qkv_prep = (
-                not self.is_kv_shared
-                and not self.fuse_qk_norm_rope
+                not self.fuse_qk_norm_rope
                 and not self.skip_rope
-                # FlashInfer trtllm-gen consumes separate FP8 tensors. Native
-                # TRTLLM instead consumes the kernel's packed BF16 output.
-                and (use_flashinfer_fp8 or use_trtllm_bf16)
-                and getattr(self.attn, "has_fp8_kv_cache", False)
+                # KV-shared layers rope only Q, which every backend takes as
+                # BF16. Otherwise: FlashInfer consumes separate Q/K/V (FP8 on
+                # trtllm-gen with an FP8 cache, BF16 elsewhere), and native
+                # TRTLLM consumes the kernel's packed BF16 output.
+                and (
+                    self.is_kv_shared
+                    or self.attn_backend == "FLASHINFER"
+                    or self._use_trtllm_fused_qkv_prep
+                )
                 and rot is not None
                 and getattr(rot, "is_neox", False)
                 and not getattr(rot, "inverse", False)
@@ -528,8 +534,17 @@ class Gemma4Attention(QKNormRoPEAttention):
                 and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
                 and self.q_norm.variance_epsilon == self.v_norm.variance_epsilon
             )
-            self._fused_qkv_prep_out_fp8 = use_flashinfer_fp8
+            self._fused_qkv_prep_out_fp8 = use_flashinfer_fp8 and not self.is_kv_shared
         return self._fused_qkv_prep
+
+    def _fused_qkv_prep_applicable(self, q: torch.Tensor, position_ids) -> bool:
+        return (
+            position_ids is not None
+            and q.dtype == torch.bfloat16
+            and not self._fused_prep_blocked
+            and not is_torch_compiling()
+            and self._fused_qkv_prep_enabled()
+        )
 
     def apply_rope(
         self,
@@ -544,6 +559,20 @@ class Gemma4Attention(QKNormRoPEAttention):
             # q_norm and rotary directly to q (Q-only fast path) without
             # the zero-padding / split_qkv / rope-on-zeros round-trip.
             if self.is_kv_shared:
+                if k is None and v is None and self._fused_qkv_prep_applicable(q, position_ids):
+                    q, _, _ = gemma4_fused_qkv_norm_rope_quant(
+                        q,
+                        position_ids,
+                        self.rotary_emb.rotary_cos_sin,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        self.q_norm.variance_epsilon,
+                        self.num_heads,
+                        0,
+                        self.head_dim,
+                        out_fp8=False,
+                    )
+                    return q, None, None
                 q_raw = self.q_norm(q.reshape(-1, self.head_dim)).reshape(-1, self.q_size)
                 if not self.skip_rope and self.rotary_emb is not None:
                     # self.rotary_emb.forward supports a list of targets;
@@ -560,15 +589,7 @@ class Gemma4Attention(QKNormRoPEAttention):
             # emits Q/K/V directly — replacing the reshape copies, three
             # norms, and the rope launch. The FlashInfer trtllm-gen path also
             # emits FP8 here instead of launching three backend casts.
-            if (
-                k is None
-                and v is None
-                and position_ids is not None
-                and q.dtype == torch.bfloat16
-                and not self._fused_prep_blocked
-                and not is_torch_compiling()
-                and self._fused_qkv_prep_enabled()
-            ):
+            if k is None and v is None and self._fused_qkv_prep_applicable(q, position_ids):
                 return gemma4_fused_qkv_norm_rope_quant(
                     q,
                     position_ids,

@@ -38,13 +38,16 @@ The kernel processes BLOCK_N tokens per program (2D [BLOCK_N, HALF] tiles)
 so each thread issues wide vectorized loads/stores instead of one scalar
 element; tile size and warp count are fixed host-side as a pure function of
 head_dim (no runtime autotuning, so launches stay deterministic under
-CUDA-graph capture). Tuned on B200: 363 -> ~75 us/call at ~6.5k tokens for
-the 64-head hd=256 shape (~4.3 TB/s effective), 2.8x on the graph-replayed
-decode shape.
+CUDA-graph capture), with one tile size for SM100 and a smaller one for
+SM120.
+
+With ``num_kv_heads=0`` the kernel runs Q only (KV-shared layers, whose K/V
+come from an earlier layer's cache): per-head q_norm + RoPE over a [N, NQ*HD]
+input, with every program a Q head.
 
 The unfused path is kept only for configurations this kernel does not
-support (KV-shared layers, non-FP8 KV cache, custom-mask multimodal
-prefill, torch.compile).
+support (custom-mask multimodal prefill, torch.compile, rope tables that do
+not span the head).
 """
 
 from typing import Optional, Tuple
@@ -52,6 +55,8 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._utils import get_sm_version
 
 
 @triton.jit
@@ -145,7 +150,8 @@ def gemma4_fused_qkv_norm_rope_quant(
 
     Args:
         qkv: [N, num_q_heads*head_dim + 2*num_kv_heads*head_dim] bf16, packed
-            [q | k | v]; may have a row stride larger than its width.
+            [q | k | v]; may have a row stride larger than its width. With
+            num_kv_heads=0 it holds Q only.
         position_ids: flattenable to [N]; integer rope positions per token.
         cos_sin: [max_positions, 2, head_dim // 2] fp32 contiguous table
             (RotaryEmbedding.rotary_cos_sin layout).
@@ -159,12 +165,16 @@ def gemma4_fused_qkv_norm_rope_quant(
 
     Returns:
         Separate mode returns contiguous ``(q, k, v)`` tensors in the
-        requested output dtype. Packed mode returns ``(qkv, None, None)``
+        requested output dtype; Q-only input (num_kv_heads=0) returns
+        ``(q, None, None)``. Packed mode returns ``(qkv, None, None)``
         with contiguous BF16 QKV. In both modes q/k are roped and v is
         norm-only.
     """
     if packed_output and out_fp8:
         raise ValueError("packed_output requires BF16 output")
+    q_only = num_kv_heads == 0
+    if q_only and packed_output:
+        raise ValueError("packed_output requires K/V heads")
 
     assert qkv.dim() == 2 and qkv.stride(-1) == 1
     assert qkv.dtype == torch.bfloat16
@@ -196,13 +206,12 @@ def gemma4_fused_qkv_norm_rope_quant(
         if packed_output:
             assert packed_qkv is not None
             return packed_qkv, None, None
-        return q_out, k_out, v_out
+        return (q_out, None, None) if q_only else (q_out, k_out, v_out)
 
-    # ~2k-element tiles keep every thread on wide vectorized accesses without
-    # spilling: 16 tokens/program for hd=256, 8 for hd=512 (B200-tuned, see
-    # module docstring). head_dim is a power of two on every gated shape, so
-    # block_n is too (required by tl.arange).
-    block_n = max(1, min(32, 4096 // head_dim))
+    # 4k-element tiles on SM100, 2k on SM120 (more CTAs). head_dim is a power
+    # of two, so block_n is too (required by tl.arange).
+    tile_elems = 2048 if get_sm_version() >= 120 else 4096
+    block_n = max(1, min(32, tile_elems // head_dim))
     grid = (num_q_heads + 2 * num_kv_heads, triton.cdiv(n, block_n))
     _gemma4_qkv_norm_rope_quant_kernel[grid](
         qkv,
@@ -230,4 +239,4 @@ def gemma4_fused_qkv_norm_rope_quant(
     if packed_output:
         assert packed_qkv is not None
         return packed_qkv, None, None
-    return q_out, k_out, v_out
+    return (q_out, None, None) if q_only else (q_out, k_out, v_out)

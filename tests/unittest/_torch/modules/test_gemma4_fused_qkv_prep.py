@@ -59,9 +59,10 @@ def _ref_chain(qkv, position_ids, cos_sin, q_w, k_w, eps, nq, nk, hd, out_fp8):
             y = y * w.float()
         return y.to(torch.bfloat16)
 
-    qn = norm(q, q_w).view(-1, nq, hd)
-    kn = norm(k, k_w).view(-1, nk, hd)
-    vn = norm(v, None).view(-1, kv_size)
+    n = qkv.shape[0]
+    qn = norm(q, q_w).view(n, nq, hd)
+    kn = norm(k, k_w).view(n, nk, hd)
+    vn = norm(v, None).view(n, kv_size)
 
     half = hd // 2
     cs = cos_sin[position_ids.view(-1).long()]  # [N, 2, half] fp32
@@ -226,6 +227,93 @@ def test_fused_qkv_prep_rejects_packed_fp8():
             1,
             128,
             out_fp8=True,
+            packed_output=True,
+        )
+
+
+def _assert_close_bf16(f, r, name):
+    assert torch.allclose(f.float(), r.float(), atol=0.02, rtol=0.02), (
+        f"{name}: max diff {(f.float() - r.float()).abs().max()}"
+    )
+
+
+@pytest.mark.parametrize(
+    "hd,rotary_frac,theta",
+    [
+        (256, 1.0, 10000.0),  # Gemma4-E4B sliding layers
+        (512, 0.25, 1000000.0),  # Gemma4-E4B full layers (padded freqs)
+    ],
+)
+# 32 = decode verify width (8 requests x 4 tokens); 4437 = a mixed-batch width.
+@pytest.mark.parametrize("n_tokens", [1, 32, 4437])
+def test_fused_qkv_prep_parity_bf16_e4b(hd, rotary_frac, theta, n_tokens):
+    """BF16 separate outputs (FlashInfer BF16 KV) at Gemma4-E4B shapes (8 q / 2 kv heads)."""
+    torch.manual_seed(3)
+    nq, nk, max_pos = 8, 2, 16384
+    qkv = torch.randn((n_tokens, (nq + 2 * nk) * hd), dtype=torch.bfloat16, device="cuda")
+    position_ids = torch.randint(0, max_pos, (n_tokens,), dtype=torch.int32, device="cuda")
+    cos_sin = _make_cos_sin(max_pos, hd, rotary_frac, theta)
+    q_w = torch.rand((hd,), dtype=torch.bfloat16, device="cuda") + 0.5
+    k_w = torch.rand((hd,), dtype=torch.bfloat16, device="cuda") + 0.5
+
+    fused = gemma4_fused_qkv_norm_rope_quant(
+        qkv, position_ids, cos_sin, q_w, k_w, 1e-6, nq, nk, hd, out_fp8=False
+    )
+    ref = _ref_chain(qkv, position_ids, cos_sin, q_w, k_w, 1e-6, nq, nk, hd, out_fp8=False)
+    for f, r, name in zip(fused, ref, "qkv"):
+        _assert_close_bf16(f, r, name)
+
+
+@pytest.mark.parametrize(
+    "nq,hd,rotary_frac,theta",
+    [
+        (8, 256, 1.0, 10000.0),
+        (8, 512, 0.25, 1000000.0),
+        (32, 256, 1.0, 10000.0),
+    ],
+)
+@pytest.mark.parametrize("n_tokens", [0, 1, 32, 333, 4437])
+def test_fused_qkv_prep_q_only(nq, hd, rotary_frac, theta, n_tokens):
+    """num_kv_heads=0 (KV-shared layers): q_norm + RoPE over a row-strided Q-only input."""
+    torch.manual_seed(5)
+    max_pos = 16384
+    q_size = nq * hd
+    buf = torch.randn((n_tokens, q_size + 128), dtype=torch.bfloat16, device="cuda")
+    q = buf[:, :q_size]
+    position_ids = torch.randint(0, max_pos, (n_tokens,), dtype=torch.int32, device="cuda")
+    cos_sin = _make_cos_sin(max_pos, hd, rotary_frac, theta)
+    q_w = torch.rand((hd,), dtype=torch.bfloat16, device="cuda") + 0.5
+
+    fq, fk, fv = gemma4_fused_qkv_norm_rope_quant(
+        q, position_ids, cos_sin, q_w, q_w, 1e-6, nq, 0, hd, out_fp8=False
+    )
+    assert fk is None and fv is None
+    assert fq.shape == (n_tokens, q_size) and fq.is_contiguous()
+    if n_tokens == 0:
+        return
+    rq, _, _ = _ref_chain(
+        q.contiguous(), position_ids, cos_sin, q_w, q_w, 1e-6, nq, 0, hd, out_fp8=False
+    )
+    _assert_close_bf16(fq, rq, "q")
+
+
+def test_fused_qkv_prep_rejects_packed_q_only():
+    q = torch.empty((0, 128), dtype=torch.bfloat16, device="cuda")
+    position_ids = torch.empty(0, dtype=torch.int32, device="cuda")
+    cos_sin = torch.empty((1, 2, 64), dtype=torch.float32, device="cuda")
+    weight = torch.empty(128, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="packed_output requires K/V heads"):
+        gemma4_fused_qkv_norm_rope_quant(
+            q,
+            position_ids,
+            cos_sin,
+            weight,
+            weight,
+            1e-6,
+            1,
+            0,
+            128,
+            out_fp8=False,
             packed_output=True,
         )
 
