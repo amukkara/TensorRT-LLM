@@ -1276,6 +1276,24 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         self.rescale_fused_weights(module)
 
 
+def fp8_qdq_static_input_scale(
+        module: torch.nn.Module) -> Optional[torch.Tensor]:
+    """Static FP8 input scale of a Linear that accepts pre-quantized FP8 input.
+
+    Returns the per-tensor ``input_scale`` for an FP8 per-tensor QDQ Linear
+    with a static input scale, so a producer may pass it ``float8_e4m3fn``
+    input. Returns None otherwise (including row-parallel Linears).
+    """
+    quant_method = getattr(module, "quant_method", None)
+    if (not isinstance(quant_method, FP8QDQLinearMethod)
+            or quant_method.requires_unquantized_activation
+            or getattr(module, "bias", None) is not None or
+        (getattr(module, "tp_size", 1) > 1
+         and getattr(module, "tp_mode", None) == TensorParallelMode.ROW)):
+        return None
+    return quant_method.get_static_input_scale(module)
+
+
 class W8A16FP8LinearMethod(FP8QDQLinearMethod):
     """W8A16 FP8 linear using on-the-fly weight dequantization.
 
