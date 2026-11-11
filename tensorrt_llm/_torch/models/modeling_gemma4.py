@@ -16,6 +16,7 @@
 
 import copy
 import dataclasses
+import functools
 import math
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
@@ -50,9 +51,12 @@ from ..attention.backends.interface import (
 )
 from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..kernels.fused_ops.gelu_tanh_mul import gelu_tanh_mul
 from ..kernels.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
+from ..kernels.fused_ops.gelu_tanh_mul_fp8_quant import gelu_tanh_mul_fp8_quant
 from ..kernels.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
 from ..kernels.fused_ops.rmsnorm_residual_add import (
+    rmsnorm_fp8_quant,
     rmsnorm_residual_add,
     rmsnorm_residual_add_scale,
 )
@@ -61,7 +65,13 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
-from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ..modules.linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+    fp8_qdq_static_input_scale,
+)
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
@@ -211,7 +221,7 @@ def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
 
 
 class _Gemma4GeluQuantMLP(GatedMLP):
-    """GatedMLP that fuses gelu_tanh+mul into the down_proj NVFP4 quantize.
+    """GatedMLP that fuses gelu_tanh+mul into the down_proj NVFP4 or FP8 quantize.
 
     On the NVFP4 down_proj path the unfused chain writes the bf16 activation
     to HBM (flashinfer_gelu_tanh_and_mul) and immediately reads it back to
@@ -227,6 +237,17 @@ class _Gemma4GeluQuantMLP(GatedMLP):
         # Decided lazily on first use: down_proj quant attributes are
         # finalized after __init__.
         self._fused_gelu_quant: Optional[bool] = None
+
+    @functools.cached_property
+    def _gelu_fp8_scale(self) -> Optional[torch.Tensor]:
+        """Static FP8 input scale of down_proj when gelu_tanh+mul can emit FP8 for it."""
+        scale = fp8_qdq_static_input_scale(self.down_proj) if self.activation is gelu_tanh else None
+        logger.info_once(
+            f"Gemma4 fused gelu_tanh+FP8-quant MLP path: "
+            f"{'enabled' if scale is not None else 'disabled'}",
+            key="gemma4_fused_gelu_fp8",
+        )
+        return scale
 
     def _fused_gelu_quant_enabled(self) -> bool:
         if self._fused_gelu_quant is None:
@@ -260,6 +281,16 @@ class _Gemma4GeluQuantMLP(GatedMLP):
         ):
             fp4, sf = gelu_tanh_mul_fp4_quant(x, self.down_proj.input_scale)
             return Fp4QuantizedTensor(fp4, sf)
+        if (
+            not has_lora
+            and isinstance(x, torch.Tensor)
+            and x.dim() == 2
+            and x.dtype == torch.bfloat16
+            and not is_torch_compiling()
+        ):
+            fp8_scale = self._gelu_fp8_scale
+            if fp8_scale is not None:
+                return gelu_tanh_mul_fp8_quant(x, fp8_scale)
         return super()._apply_activation(x, has_lora=has_lora)
 
 
@@ -898,6 +929,14 @@ class Gemma4DecoderLayer(DecoderLayer):
         # next layer skips its standalone input-norm pass.
         self._next_input_layernorm: Optional[RMSNorm] = None
         self._fused_tail_norm2: Optional[bool] = None
+        # The next layer's QKV projection (wired with the norm above), so the
+        # fused tail can emit that norm already quantized when it is FP8.
+        self._next_qkv_proj: Optional[nn.Module] = None
+        # Fused PLE tail (post_ffn norm+add, then post-PLE norm+add+scale).
+        self._fused_ple_tail: Optional[bool] = None
+        # Static FP8 input scales of the norm consumers (qkv_proj, gate_up_proj
+        # and the next layer's qkv_proj); resolved after weight loading.
+        self._fp8_norm_scales: Optional[Dict[str, Optional[torch.Tensor]]] = None
 
         # MoE block (parallel with dense MLP)
         self.enable_moe_block = getattr(config, "enable_moe_block", False)
@@ -1001,6 +1040,80 @@ class Gemma4DecoderLayer(DecoderLayer):
             )
         return self._fused_norm_quant
 
+    def _fp8_norm_scale(self, consumer: str) -> Optional[torch.Tensor]:
+        """Static FP8 input scale of the Linear a norm feeds, if it takes FP8 input.
+
+        When set, the norm emits FP8 directly.
+        """
+        if self._fp8_norm_scales is None:
+            norms = {
+                "qkv": self.input_layernorm,
+                "gate_up": self.pre_feedforward_layernorm,
+                "next_qkv": self._next_input_layernorm,
+            }
+            consumers = {
+                "qkv": self.self_attn.qkv_proj,
+                "gate_up": self.mlp.gate_up_proj,
+                "next_qkv": self._next_qkv_proj,
+            }
+            self._fp8_norm_scales = {
+                name: (
+                    fp8_qdq_static_input_scale(consumers[name])
+                    if consumers[name] is not None
+                    and norms[name] is not None
+                    and self._norm_is_plain_bf16(norms[name])
+                    else None
+                )
+                for name in consumers
+            }
+            logger.info_once(
+                "Gemma4 fused RMSNorm+FP8-quant paths: "
+                + ", ".join(
+                    f"{k}={'on' if v is not None else 'off'}"
+                    for k, v in self._fp8_norm_scales.items()
+                ),
+                key="gemma4_fused_norm_fp8",
+            )
+        return self._fp8_norm_scales[consumer]
+
+    def _fused_ple_tail_enabled(self) -> bool:
+        if self._fused_ple_tail is None:
+            self._fused_ple_tail = (
+                bool(self.hidden_size_per_layer_input)
+                and not self.enable_moe_block
+                and self._norm_is_plain_bf16(self.post_feedforward_layernorm)
+                and self._norm_is_plain_bf16(self.post_per_layer_input_norm)
+                and self.layer_scalar.dtype == torch.float32
+                and self.layer_scalar.numel() == 1
+            )
+            logger.info_once(
+                f"Gemma4 fused PLE layer-tail path: "
+                f"{'enabled' if self._fused_ple_tail else 'disabled'}",
+                key="gemma4_fused_ple_tail",
+            )
+        return self._fused_ple_tail
+
+    def _norm_add_scale_tail(
+        self, x: torch.Tensor, residual: torch.Tensor, norm: RMSNorm
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """``bf16((residual + norm(x)) * layer_scalar)``, plus the next layer's input norm if wired."""
+        if self._fused_tail_norm2_enabled():
+            # Also emit the next layer's input norm (FP8 if its QKV takes FP8).
+            nxt = self._next_input_layernorm
+            return rmsnorm_residual_add_scale(
+                x,
+                residual,
+                norm.weight,
+                self.layer_scalar,
+                norm.variance_epsilon,
+                next_norm_weight=nxt.weight,
+                next_norm_eps=nxt.variance_epsilon,
+                next_norm_quant_scale=self._fp8_norm_scale("next_qkv"),
+            )
+        return rmsnorm_residual_add_scale(
+            x, residual, norm.weight, self.layer_scalar, norm.variance_epsilon
+        )
+
     def _fused_tail_norm2_enabled(self) -> bool:
         if self._fused_tail_norm2 is None:
             nxt = self._next_input_layernorm
@@ -1040,10 +1153,24 @@ class Gemma4DecoderLayer(DecoderLayer):
 
         # Self-attention
         residual = hidden_states
+        fusable = (
+            not lora_params
+            and isinstance(hidden_states, torch.Tensor)
+            and hidden_states.dim() == 2
+            and hidden_states.dtype == torch.bfloat16
+            and not is_torch_compiling()
+        )
         if pre_normed is not None:
             # The previous layer's fused tail already emitted this layer's
             # input norm as its second output.
             hidden_states = pre_normed
+        elif fusable and self._fp8_norm_scale("qkv") is not None:
+            hidden_states = rmsnorm_fp8_quant(
+                hidden_states,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+                self._fp8_norm_scale("qkv"),
+            )
         else:
             hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -1059,8 +1186,10 @@ class Gemma4DecoderLayer(DecoderLayer):
             **kwargs,
         )
         # Fused post_attention RMSNorm + residual add (one kernel instead of
-        # a norm round-trip plus a separate add). The unfused sequence remains
-        # for configurations the kernel does not support.
+        # a norm round-trip plus a separate add). When gate_up takes FP8 input,
+        # it also emits the pre_feedforward norm in FP8. The unfused sequence
+        # remains for configurations the kernel does not support.
+        ffn_input = None
         if (
             isinstance(hidden_states, torch.Tensor)
             and hidden_states.dim() == 2
@@ -1069,12 +1198,24 @@ class Gemma4DecoderLayer(DecoderLayer):
             and not is_torch_compiling()
             and self._fused_norm_add_enabled()
         ):
-            hidden_states = rmsnorm_residual_add(
-                hidden_states,
-                residual,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.variance_epsilon,
-            )
+            gate_up_scale = self._fp8_norm_scale("gate_up") if not lora_params else None
+            if gate_up_scale is not None:
+                hidden_states, ffn_input = rmsnorm_residual_add(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                    next_norm_weight=self.pre_feedforward_layernorm.weight,
+                    next_norm_eps=self.pre_feedforward_layernorm.variance_epsilon,
+                    next_norm_quant_scale=gate_up_scale,
+                )
+            else:
+                hidden_states = rmsnorm_residual_add(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
         else:
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = residual + hidden_states
@@ -1087,7 +1228,9 @@ class Gemma4DecoderLayer(DecoderLayer):
         # input_scale / alpha the unfused quantize would use; the fused
         # kernel skips the intermediate bf16 round, so the GEMM inputs are
         # near- rather than byte-identical).
-        if (
+        if ffn_input is not None:
+            hidden_states = self.mlp(ffn_input, lora_params=lora_params)
+        elif (
             not lora_params
             and isinstance(hidden_states, torch.Tensor)
             and hidden_states.dim() == 2
@@ -1141,27 +1284,32 @@ class Gemma4DecoderLayer(DecoderLayer):
             and not is_torch_compiling()
             and self._fused_tail_enabled()
         ):
-            if self._fused_tail_norm2_enabled():
-                # Also emit the next layer's input norm as a second output
-                # (returned as a (hidden, pre_normed) pair the model loop
-                # hands to the next layer).
-                nxt = self._next_input_layernorm
-                return rmsnorm_residual_add_scale(
-                    hidden_states,
-                    residual,
-                    self.post_feedforward_layernorm.weight,
-                    self.layer_scalar,
-                    self.post_feedforward_layernorm.variance_epsilon,
-                    next_norm_weight=nxt.weight,
-                    next_norm_eps=nxt.variance_epsilon,
-                )
-            return rmsnorm_residual_add_scale(
+            return self._norm_add_scale_tail(
+                hidden_states, residual, self.post_feedforward_layernorm
+            )
+
+        # Fused PLE tail: post_ffn norm + add, then post-PLE norm + add + layer_scalar.
+        if (
+            per_layer_input is not None
+            and isinstance(hidden_states, torch.Tensor)
+            and hidden_states.dim() == 2
+            and hidden_states.dtype == torch.bfloat16
+            and residual.shape == hidden_states.shape
+            and not is_torch_compiling()
+            and self._fused_ple_tail_enabled()
+        ):
+            hidden_states = rmsnorm_residual_add(
                 hidden_states,
                 residual,
                 self.post_feedforward_layernorm.weight,
-                self.layer_scalar,
                 self.post_feedforward_layernorm.variance_epsilon,
             )
+            residual = hidden_states
+            gate = self.per_layer_input_gate(hidden_states)
+            # One kernel for gelu and the multiply (per_layer_input is a strided row slice).
+            gated = gelu_tanh_mul(gate, per_layer_input)
+            projected = self.per_layer_projection(gated)
+            return self._norm_add_scale_tail(projected, residual, self.post_per_layer_input_norm)
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -1225,6 +1373,7 @@ class Gemma4TextModel(DecoderModel):
         # plain single-output tail; the model-final self.norm is separate).
         for prev_layer, next_layer in zip(self.layers[:-1], self.layers[1:]):
             prev_layer._next_input_layernorm = next_layer.input_layernorm
+            prev_layer._next_qkv_proj = next_layer.self_attn.qkv_proj
 
         self.norm = RMSNorm(
             hidden_size=pretrained.hidden_size,

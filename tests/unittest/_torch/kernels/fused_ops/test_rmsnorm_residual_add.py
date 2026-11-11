@@ -20,7 +20,11 @@ Covers the three variants served by the shared kernel body:
   bf16 cast),
 - ``rmsnorm_residual_add`` (no scalar stage),
 - the optional second output (the RMSNorm of the bf16-rounded primary
-  output, e.g. the next decoder layer's input norm).
+  output, e.g. the next decoder layer's input norm), in bf16 or FP8,
+- ``rmsnorm_fp8_quant`` (norm + static per-tensor FP8 quantize).
+
+FP8 outputs are compared against static_quantize_e4m3_per_tensor of the
+bf16 reference, i.e. the quantize the consuming FP8 Linear would run.
 
 Each reference reproduces the exact serving-path op sequence it replaces
 (flashinfer_rmsnorm + aten ops). The only tolerated difference is the fp32
@@ -34,6 +38,7 @@ import torch
 import tensorrt_llm  # noqa: F401  (registers trtllm torch ops)
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops  # noqa: F401
 from tensorrt_llm._torch.kernels.fused_ops.rmsnorm_residual_add import (
+    rmsnorm_fp8_quant,
     rmsnorm_residual_add,
     rmsnorm_residual_add_scale,
 )
@@ -133,6 +138,76 @@ def test_rmsnorm_residual_add_scale_dual_norm_parity(n_tokens, hidden):
     ref_n2 = torch.ops.trtllm.flashinfer_rmsnorm(out, w2, 1e-6)
     mm2 = _mismatch(n2, ref_n2)
     assert mm2 < 1e-4, f"secondary-norm bf16 mismatch fraction {mm2}"
+
+
+def _fp8_mismatch(a, b):
+    return (a.view(torch.uint8) != b.view(torch.uint8)).float().mean().item()
+
+
+def _static_quant(x, qs):
+    return torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, qs)[0]
+
+
+# 2560 is the Gemma4-E4B hidden size; 32 its decode verify width (8 x 4).
+@pytest.mark.parametrize("n_tokens", [0, 1, 32, 333, 4437])
+@pytest.mark.parametrize("hidden", [2560, 5376])
+@pytest.mark.parametrize("quant_scale", [0.05, 0.03, 0.003])  # 0.03: FP8 ties; 0.003 saturates
+def test_rmsnorm_fp8_quant_parity(n_tokens, hidden, quant_scale):
+    torch.manual_seed(5)
+    x = torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda") * 3
+    w = torch.rand((hidden,), dtype=torch.bfloat16, device="cuda") + 0.5
+    qs = torch.tensor([quant_scale], dtype=torch.float32, device="cuda")
+    fused = rmsnorm_fp8_quant(x, w, 1e-6, qs)
+    assert fused.dtype == torch.float8_e4m3fn and fused.shape == x.shape
+    if n_tokens == 0:
+        return
+    ref = _static_quant(torch.ops.trtllm.flashinfer_rmsnorm(x, w, 1e-6), qs)
+    mm = _fp8_mismatch(fused, ref)
+    assert mm < 1e-4, f"fp8 mismatch fraction {mm}"
+
+
+@pytest.mark.parametrize("n_tokens", [1, 32, 4437])
+@pytest.mark.parametrize("hidden", [2560, 5376])
+def test_rmsnorm_residual_add_scale_fp8_next_norm(n_tokens, hidden):
+    """The secondary next-layer norm emitted as FP8 for an FP8 QKV projection."""
+    torch.manual_seed(13)
+    x = torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    r = torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    w = torch.rand((hidden,), dtype=torch.bfloat16, device="cuda") + 0.5
+    w2 = torch.rand((hidden,), dtype=torch.bfloat16, device="cuda") + 0.5
+    sc = torch.tensor([0.987654], dtype=torch.float32, device="cuda")
+    qs = torch.tensor([0.02], dtype=torch.float32, device="cuda")
+    out, n2 = rmsnorm_residual_add_scale(
+        x, r, w, sc, 1e-6, next_norm_weight=w2, next_norm_eps=1e-6, next_norm_quant_scale=qs
+    )
+    assert out.dtype == torch.bfloat16 and n2.dtype == torch.float8_e4m3fn
+    assert _mismatch(out, _reference(x, r, w, sc, 1e-6)) < 1e-4
+    ref_n2 = _static_quant(torch.ops.trtllm.flashinfer_rmsnorm(out, w2, 1e-6), qs)
+    mm = _fp8_mismatch(n2, ref_n2)
+    assert mm < 1e-4, f"secondary-norm fp8 mismatch fraction {mm}"
+
+
+@pytest.mark.parametrize("n_tokens", [1, 32, 4437])
+@pytest.mark.parametrize("hidden", [2560, 5376])
+def test_rmsnorm_residual_add_fp8_next_norm(n_tokens, hidden):
+    """Post-attention norm + add that also emits the pre-feedforward norm as FP8.
+
+    Must match rmsnorm_residual_add followed by rmsnorm_fp8_quant on its output.
+    """
+    torch.manual_seed(17)
+    x = torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    r = torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    w = torch.rand((hidden,), dtype=torch.bfloat16, device="cuda") + 0.5
+    w2 = torch.rand((hidden,), dtype=torch.bfloat16, device="cuda") + 0.5
+    qs = torch.tensor([0.03], dtype=torch.float32, device="cuda")
+    out, n2 = rmsnorm_residual_add(
+        x, r, w, 1e-6, next_norm_weight=w2, next_norm_eps=1e-6, next_norm_quant_scale=qs
+    )
+    assert out.dtype == torch.bfloat16 and n2.dtype == torch.float8_e4m3fn
+    ref = rmsnorm_residual_add(x, r, w, 1e-6)
+    assert _mismatch(out, ref) < 1e-4
+    mm = _fp8_mismatch(n2, rmsnorm_fp8_quant(out, w2, 1e-6, qs))
+    assert mm < 1e-4, f"secondary-norm fp8 mismatch fraction {mm}"
 
 
 if __name__ == "__main__":

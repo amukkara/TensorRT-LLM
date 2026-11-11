@@ -870,6 +870,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         # The opt-in low-M dispatcher races cuBLAS against the low-M FP8 GEMM
         # for static-scale projections; None falls through to the stock path.
         if (static_input_scale is not None and bias is None
+                and input.dtype != torch.float8_e4m3fn
                 and _should_apply_low_m_gemm(input, module)):
             dispatcher = low_m_gemm_dispatcher(module)
             output = dispatcher.apply_fp8(
@@ -1204,6 +1205,24 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         Post-process weights after all partial loads are complete.
         """
         self.rescale_fused_weights(module)
+
+
+def fp8_qdq_static_input_scale(
+        module: torch.nn.Module) -> Optional[torch.Tensor]:
+    """Static FP8 input scale of a Linear that accepts pre-quantized FP8 input.
+
+    Returns the per-tensor ``input_scale`` for an FP8 per-tensor QDQ Linear
+    with a static input scale, so a producer may pass it ``float8_e4m3fn``
+    input. Returns None otherwise (including row-parallel Linears).
+    """
+    quant_method = getattr(module, "quant_method", None)
+    if (not isinstance(quant_method, FP8QDQLinearMethod)
+            or quant_method.requires_unquantized_activation
+            or getattr(module, "bias", None) is not None or
+        (getattr(module, "tp_size", 1) > 1
+         and getattr(module, "tp_mode", None) == TensorParallelMode.ROW)):
+        return None
+    return quant_method.get_static_input_scale(module)
 
 
 class W8A16FP8LinearMethod(FP8QDQLinearMethod):
