@@ -939,6 +939,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         # The opt-in low-M dispatcher races cuBLAS against the low-M FP8 GEMM
         # for static-scale projections; None falls through to the stock path.
         if (static_input_scale is not None and bias is None
+                and input.dtype != torch.float8_e4m3fn
                 and _should_apply_low_m_gemm(input, module)):
             dispatcher = low_m_gemm_dispatcher(module)
             output = dispatcher.apply_fp8(
