@@ -20,7 +20,7 @@ import sys
 import weakref
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Any, Dict, NewType, Optional, TypeAlias, cast
+from typing import Any, Dict, NewType, Optional, Tuple, TypeAlias, cast
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -65,6 +65,119 @@ _FORCE_RAGGED_FA2 = False
 """Used for testing."""
 
 _MAX_CUDA_THREADS_PER_BLOCK = 1024
+
+# XQA workspace: the first 8 MiB are multi-block semaphores, which must start zeroed and which the
+# kernel returns to zero; the rest is multi-block partial-result scratch.
+_XQA_WORKSPACE_BYTES = 128 * 1024 * 1024
+_xqa_workspaces: Dict[int, torch.Tensor] = {}
+# Row capacity of the XQA target-verify buffers, in query tokens per request.
+_XQA_TARGET_MAX_TOKENS_PER_SEQ = 16
+
+
+def _get_xqa_workspace(device: torch.device) -> torch.Tensor:
+    """Return the per-device zero-initialized XQA workspace.
+
+    Kernels on one device run in stream order, so the layers of a forward pass share one workspace.
+    """
+    index = device.index if device.index is not None else torch.cuda.current_device(
+    )
+    workspace = _xqa_workspaces.get(index)
+    if workspace is None:
+        workspace = torch.zeros(_XQA_WORKSPACE_BYTES,
+                                dtype=torch.uint8,
+                                device=device)
+        _xqa_workspaces[index] = workspace
+    return workspace
+
+
+@functools.cache
+def _enable_xqa_wide_head_spec_dec() -> None:
+    """Let flashinfer build XQA's multi-token (speculative) mode for head_dim > 256.
+
+    ``gen_xqa_module`` rejects ``q_seq_len > 1`` above head_dim 256. If it does, wrap it to build
+    those configs with ``M_TILESIZE=16``; other configs build unchanged.
+    """
+    import flashinfer.jit.xqa as jit_xqa
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.core import gen_jit_spec
+    from flashinfer.jit.utils import filename_safe_dtype_map
+
+    xqa_api = sys.modules["flashinfer.xqa"]
+    original = jit_xqa.gen_xqa_module
+    try:
+        original(torch.bfloat16, torch.bfloat16, 32, 512, 4, False,
+                 torch.bfloat16, 2)
+        return
+    except ValueError:
+        pass
+
+    def gen_xqa_module(input_dtype,
+                       kv_cache_dtype,
+                       page_size,
+                       head_dim,
+                       head_group_ratio,
+                       use_sliding_window,
+                       output_dtype,
+                       q_seq_len=1,
+                       use_ragged_q=False):
+        if head_dim <= 256 or q_seq_len == 1:
+            return original(input_dtype, kv_cache_dtype, page_size, head_dim,
+                            head_group_ratio, use_sliding_window, output_dtype,
+                            q_seq_len, use_ragged_q)
+        if head_group_ratio > 16:
+            raise ValueError(f"head_dim {head_dim} > 256 requires "
+                             f"head_group_ratio <= 16, got {head_group_ratio}")
+        # Build the head_dim-256 spec for its flags, then swap in the wide head. The SM90 GMMA
+        # kernel (and its SPEC_Q_SEQ_LEN specialization) does not support head_dim > 256.
+        base = original(input_dtype, kv_cache_dtype, page_size, 256,
+                        head_group_ratio, use_sliding_window, output_dtype,
+                        q_seq_len, use_ragged_q)
+        dropped = ("-DHEAD_ELEMS=", "-DSPEC_Q_SEQ_LEN=", "-DUSE_SM90_MHA=")
+        flags = [f for f in base.extra_cuda_cflags if not f.startswith(dropped)]
+        flags += [
+            f"-DHEAD_ELEMS={head_dim}", "-DM_TILESIZE=16", "-DUSE_SM90_MHA=0"
+        ]
+        dtypes = filename_safe_dtype_map
+        name = (f"xqa_wide_head_input_{dtypes[input_dtype]}"
+                f"_kv_cache_{dtypes[kv_cache_dtype]}"
+                f"_output_{dtypes[output_dtype]}_page_size_{page_size}"
+                f"_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}"
+                f"_use_sliding_window_{use_sliding_window}"
+                f"_spec_q_seq_len_{q_seq_len}"
+                f"{'_ragged_q' if use_ragged_q else ''}")
+        csrc = jit_env.FLASHINFER_CSRC_DIR
+        sources = [
+            csrc / "xqa/mha.cu", csrc / "xqa/xqa_wrapper.cu",
+            csrc / "flashinfer_xqa_binding.cu"
+        ]
+        return gen_jit_spec(name,
+                            sources,
+                            extra_cuda_cflags=flags,
+                            extra_ldflags=["-lcuda"])
+
+    jit_xqa.gen_xqa_module = gen_xqa_module
+    xqa_api.gen_xqa_module = gen_xqa_module
+
+
+@functools.cache
+def _xqa_chain_mask(capacity: int, q_len: int, device: int) -> torch.Tensor:
+    """Return XQA's draft-block mask for linear chains: row t attends draft rows 0..t.
+
+    Shape ``[capacity, q_len, 2]`` uint16: one 32-bit word per row (``q_len <= 32``), low half
+    first.
+    """
+    assert 1 < q_len <= 32
+    rows = np.array([(1 << (t + 1)) - 1 for t in range(q_len)],
+                    dtype="<u4").view("<u2").reshape(q_len, 2)
+    words = torch.from_numpy(
+        np.ascontiguousarray(np.broadcast_to(rows, (capacity, q_len, 2))))
+    return words.to(f"cuda:{device}")
+
+
+@functools.cache
+def _xqa_block_offsets(width: int, device: int) -> torch.Tensor:
+    """Return ``arange(width)`` as int64 on the device, for XQA block-table gathers."""
+    return torch.arange(width, dtype=torch.int64, device=f"cuda:{device}")
 
 
 def _get_attention_layer_indices(kv_cache_manager: Any) -> list[int]:
@@ -370,6 +483,26 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _uses_full_generation_page_table: bool = field(init=False,
                                                    default=False,
                                                    repr=False)
+    # Shared-KV draft views without trtllm-gen decode run XQA, which reads KV lengths from
+    # `_draft_kv_runtime_lens` on the device and needs no plan(). One full-width block table per
+    # KV pool (key None without VSWA), refreshed by `_sync_draft_view` before every step.
+    _xqa_draft_block_tables: Optional[Dict[Optional[int],
+                                           torch.Tensor]] = field(init=False,
+                                                                  default=None,
+                                                                  repr=False)
+    # XQA inputs for target generation rows (reservation-width page table, no trtllm-gen decode).
+    # Rows 0.._xqa_target_num_rows-1: one q_len-1 row per token i of a request with n tokens and
+    # KV length L, with length L - (n - 1 - i). If all requests have the same n > 1
+    # (`_xqa_target_q_len`), one multi-token row per request follows, with length L.
+    _xqa_target_block_tables: Optional[Dict[Optional[int],
+                                            torch.Tensor]] = field(init=False,
+                                                                   default=None,
+                                                                   repr=False)
+    _xqa_target_row_kv_lens: Optional[torch.Tensor] = field(init=False,
+                                                            default=None,
+                                                            repr=False)
+    _xqa_target_num_rows: int = field(init=False, default=0, repr=False)
+    _xqa_target_q_len: int = field(init=False, default=1, repr=False)
 
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
@@ -735,6 +868,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             draft_metadata._is_separate_kv_draft_view = (
                 not uses_shared_kv_cache)
             draft_metadata._draft_metadata = None
+            # The target's XQA verify inputs describe target rows; a draft view never uses them.
+            draft_metadata._xqa_target_block_tables = None
+            draft_metadata._xqa_target_row_kv_lens = None
+            draft_metadata._xqa_target_num_rows = 0
+            draft_metadata._xqa_target_q_len = 1
             draft_metadata.workspace_buffer = self.workspace_buffer
             draft_metadata.cuda_graph_buffers = None
             draft_metadata.cross = None
@@ -865,6 +1003,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         target.seq_lens_kv_cuda[:num_seqs])
         self._draft_kv_runtime_lens[:num_seqs].copy_(full_kv_lens)
 
+        if self._xqa_draft_block_tables is not None:
+            self._build_xqa_draft_block_tables()
+
         if self.is_cuda_graph:
             # Graph replay keeps the captured trtllm-gen plan. Refresh only
             # its stable block-table buffers; re-planning the wrapper would
@@ -873,6 +1014,181 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 self._build_decode_block_tables(plan_params, wrappers)
         else:
             self._clean_cached_plans(defer_plan=False)
+
+    def get_xqa_draft_block_tables(self,
+                                   pool_id: Optional[int]) -> torch.Tensor:
+        """Return the XQA block table of one KV pool for a shared-KV draft view."""
+        if not self._is_shared_kv_draft_view:
+            raise RuntimeError(
+                "XQA draft block tables exist only on the shared-KV view")
+        if self._xqa_draft_block_tables is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "XQA draft block tables must be built by an eager forward "
+                    "before CUDA graph capture.")
+            self._build_xqa_draft_block_tables()
+        if pool_id not in self._xqa_draft_block_tables:
+            raise RuntimeError(
+                f"No XQA draft block table for KV pool {pool_id}")
+        return self._xqa_draft_block_tables[pool_id][:self.num_seqs]
+
+    def _build_xqa_draft_block_tables(self) -> None:
+        """Write the target page table into the per-pool XQA block tables of the draft view.
+
+        Rows follow the view's sequence order (contexts first, as in the target).
+        """
+        if self._xqa_draft_block_tables is None:
+            self._xqa_draft_block_tables = {}
+        num_seqs = self.num_seqs
+        self._write_xqa_block_tables(self._xqa_draft_block_tables,
+                                     self.max_num_requests,
+                                     self.paged_kv_indptr_decode[:num_seqs],
+                                     self.num_blocks[:num_seqs])
+
+    def _write_xqa_block_tables(self,
+                                tables: Dict[Optional[int], torch.Tensor],
+                                capacity: int,
+                                row_block_starts: Optional[torch.Tensor] = None,
+                                num_blocks: Optional[list[int]] = None) -> None:
+        """Gather rows of the device page indices into persistent per-pool XQA block tables.
+
+        ``tables`` maps each KV pool (key None without VSWA) to a ``[capacity,
+        max_blocks_per_seq]`` table, allocated here once so captured kernels keep a stable address.
+        Row r takes the pool's flat page indices from ``row_block_starts[r]`` on; XQA reads only
+        the pages its KV length covers. Without ``row_block_starts``, only allocates.
+        """
+        width = self._max_num_blocks_per_seq
+        if (self._vswa_layer_to_pool is not None
+                and self._vswa_pool_indices_cache is not None):
+            pool_sources = self._vswa_pool_indices_cache
+        else:
+            pool_sources = {None: self._paged_kv_indices}
+        for pool_id in pool_sources:
+            if pool_id not in tables:
+                tables[pool_id] = torch.zeros((capacity, width),
+                                              dtype=torch.int32,
+                                              device='cuda')
+        if row_block_starts is None or row_block_starts.numel() == 0:
+            return
+
+        if max(num_blocks) > width:
+            raise RuntimeError(
+                f"XQA block table needs {max(num_blocks)} blocks per sequence, "
+                f"but capacity is {width}")
+        last_block = self.num_context_blocks + self.num_generation_blocks - 1
+        block_index = (row_block_starts[:, None] + _xqa_block_offsets(
+            width, row_block_starts.device.index)).clamp_(max=last_block)
+        for pool_id, indices in pool_sources.items():
+            torch.take(indices,
+                       block_index,
+                       out=tables[pool_id][:block_index.size(0)])
+
+    def uses_xqa_target_decode(self, flashinfer_backend: str) -> bool:
+        """Whether this layer's target generation rows run XQA instead of a decode plan.
+
+        The reservation-width page table keeps attention-visible lengths only on the device;
+        FA2 plans need them on the host, while trtllm-gen and XQA read them on the device.
+        """
+        return (self._uses_full_generation_page_table
+                and flashinfer_backend != "trtllm-gen"
+                and not self._is_shared_kv_draft_view
+                and not self._is_separate_kv_draft_view)
+
+    def get_xqa_target_inputs(
+            self, pool_id: Optional[int],
+            multi_token: bool) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Return the XQA block table of one KV pool, the per-row KV lengths and query tokens
+        per row.
+
+        With ``multi_token`` and equal query lengths, each row is a whole request for XQA's
+        multi-token mode; otherwise each row is one query token.
+        """
+        if self._xqa_target_block_tables is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "XQA target block tables must be built by an eager forward "
+                    "before CUDA graph capture.")
+            # Lengths come from `_logical_kv_lens`, which already carries any overlap offsets
+            # applied this step; later prepare() builds are corrected along with it.
+            self._build_xqa_target_inputs()
+        if pool_id not in self._xqa_target_block_tables:
+            raise RuntimeError(
+                f"No XQA target block table for KV pool {pool_id}")
+        rows = slice(0, self._xqa_target_num_rows)
+        q_len = 1
+        if multi_token and self._xqa_target_q_len > 1:
+            q_len = self._xqa_target_q_len
+            rows = slice(rows.stop, rows.stop + self.num_generations)
+        return (self._xqa_target_block_tables[pool_id][rows],
+                self._xqa_target_row_kv_lens[rows], q_len)
+
+    def _build_xqa_target_inputs(self) -> None:
+        """Write the generation rows' XQA block tables and KV lengths.
+
+        Buffers are allocated once so captured kernels keep stable addresses. Row lengths are
+        gathered on the device from `_logical_kv_lens`.
+        """
+        num_contexts = self.num_contexts
+        num_generations = self.num_generations
+        capacity = min(self.max_num_tokens,
+                       self.max_num_requests * _XQA_TARGET_MAX_TOKENS_PER_SEQ)
+        buffer_rows = capacity + self.max_num_requests
+
+        if self._xqa_target_block_tables is None:
+            self._xqa_target_block_tables = {}
+            self._xqa_target_row_kv_lens = torch.zeros((buffer_rows, ),
+                                                       dtype=torch.int32,
+                                                       device='cuda')
+        self._xqa_target_num_rows = 0
+        self._xqa_target_q_len = 1
+        if not self._uses_full_generation_page_table or num_generations == 0:
+            self._write_xqa_block_tables(self._xqa_target_block_tables,
+                                         buffer_rows)
+            return
+
+        gen = slice(num_contexts, num_contexts + num_generations)
+        row_repeats = self.seq_lens_kv.numpy()[gen].astype(np.int64)
+        num_rows = int(row_repeats.sum())
+        q_len = int(row_repeats[0])
+        if not (1 < q_len <= _XQA_TARGET_MAX_TOKENS_PER_SEQ and
+                (row_repeats == q_len).all()):
+            q_len = 1
+        if num_rows > capacity:
+            raise RuntimeError(
+                f"XQA target verify needs {num_rows} query rows, but capacity "
+                f"is {capacity}")
+        gen_num_blocks = np.asarray(self.num_blocks[gen], dtype=np.int64)
+
+        # Row r is query token i of request b: it sees KV length L_b - (n_b - 1 - i), an
+        # offset of i - (n_b - 1) from L_b. A multi-token row is a whole request: offset 0.
+        row_offsets = np.arange(num_rows) - np.repeat(
+            np.cumsum(row_repeats) - 1, row_repeats)
+        row_request = np.repeat(np.arange(num_generations), row_repeats)
+        if q_len > 1:
+            row_offsets = np.concatenate(
+                (row_offsets, np.zeros(num_generations, dtype=np.int64)))
+            row_request = np.concatenate(
+                (row_request, np.arange(num_generations)))
+        total_rows = row_request.size
+
+        # Each row's sequence index, length offset and first page, uploaded via a fresh pinned buffer.
+        gen_block_starts = self.num_context_blocks + np.cumsum(
+            gen_num_blocks) - gen_num_blocks
+        host_rows = torch.empty((3, total_rows),
+                                dtype=torch.int32,
+                                pin_memory=prefer_pinned())
+        host_rows.numpy()[0] = num_contexts + row_request
+        host_rows.numpy()[1] = row_offsets
+        host_rows.numpy()[2] = gen_block_starts[row_request]
+        device_rows = host_rows.to('cuda', non_blocking=True)
+        torch.add(self._logical_kv_lens.index_select(0, device_rows[0]),
+                  device_rows[1],
+                  out=self._xqa_target_row_kv_lens[:total_rows])
+
+        self._write_xqa_block_tables(self._xqa_target_block_tables, buffer_rows,
+                                     device_rows[2], gen_num_blocks.tolist())
+        self._xqa_target_num_rows = num_rows
+        self._xqa_target_q_len = q_len
 
     def update_shared_kv_draft_lengths(
         self,
@@ -934,6 +1250,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._logical_kv_lens[row_slice].add_(runtime_offsets, alpha=direction)
         token_offsets = runtime_offsets.repeat_interleave(tokens_per_generation)
         self._positions[token_slice].add_(token_offsets, alpha=direction)
+        if num_chunked_contexts == 0 and self._xqa_target_num_rows > 0:
+            # XQA target rows are the generation tokens in order, then (in multi-token mode)
+            # the generation requests.
+            self._xqa_target_row_kv_lens[:num_runtime_tokens].add_(
+                token_offsets, alpha=direction)
+            if self._xqa_target_q_len > 1:
+                self._xqa_target_row_kv_lens[
+                    num_runtime_tokens:num_runtime_tokens +
+                    num_generations].add_(runtime_offsets, alpha=direction)
         view = self.mixed_precision_staging
         if view is not None and view.manager is self.kv_cache_manager:
             # Keep the staging lengths in step with the KV lengths.
@@ -1915,6 +2240,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._host_paged_kv_indices = \
                 self._host_pool_indices[primary_pool_id]
 
+        if self._xqa_target_block_tables is not None:
+            self._build_xqa_target_inputs()
+
         self._debug_validate_page_table(kv_lens_host, logical_num_blocks,
                                         num_blocks)
 
@@ -2338,7 +2666,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if self.num_contexts > 0:
             prefill_plan()
 
-        if self.num_generations > 0:
+        # Generation rows that run XQA need no decode plan.
+        if (self.num_generations > 0
+                and not self.uses_xqa_target_decode(flashinfer_backend)):
             decode_plan()
 
         wrappers.is_planned = True
@@ -2734,9 +3064,25 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         kv_cache = metadata.kv_cache_manager.get_buffers(
             self.layer_idx, kv_layout=metadata.kv_layout)
 
-        # VSWA: swap in the correct pool's page indices for this layer
-        # before both the KV cache append and the attention plan/run.
-        metadata.swap_paged_kv_indices_for_layer(self.layer_idx)
+        if (metadata._is_shared_kv_draft_view
+                and self.flashinfer_backend != "trtllm-gen"):
+            self._xqa_shared_kv_draft_decode(q, k, v, kv_cache, metadata,
+                                             output, attention_mask_type,
+                                             attention_mask_data,
+                                             attention_window_size)
+            return
+
+        num_contexts = metadata.num_contexts
+        num_generations = metadata.num_generations
+        num_ctx_tokens = metadata.num_ctx_tokens
+        xqa_target_decode = (num_generations > 0
+                             and metadata.uses_xqa_target_decode(
+                                 self.flashinfer_backend))
+
+        # VSWA: swap in this layer's pool for the plan/run wrappers. XQA and the
+        # KV append read the pool's own indices, so a decode-only XQA step skips it.
+        if not (xqa_target_decode and num_contexts == 0):
+            metadata.swap_paged_kv_indices_for_layer(self.layer_idx)
 
         if k is not None and v is not None:
             k = k.view(-1, self.num_kv_heads, self.head_dim)
@@ -2757,7 +3103,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 batch_indices=metadata.batch_indices,
                 positions=metadata.positions,
                 paged_kv_cache=kv_cache,
-                kv_indices=metadata.paged_kv_indices,
+                kv_indices=metadata.get_paged_kv_indices_for_layer(
+                    self.layer_idx),
                 kv_indptr=metadata.paged_kv_indptr,
                 kv_last_page_len=metadata.paged_kv_last_page_len,
                 kv_layout=metadata.kv_layout)
@@ -2770,15 +3117,29 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 and q.dtype != kv_cache.dtype):
             q = q.to(kv_cache.dtype)
 
-        num_contexts = metadata.num_contexts
-        num_generations = metadata.num_generations
-        num_ctx_tokens = metadata.num_ctx_tokens
-
         def prefill_forward(plan_params: PlanParams, out: torch.Tensor):
             wrapper = metadata.get_prefill_wrapper(plan_params)
             wrapper.run(q[:num_ctx_tokens],
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
+
+        if xqa_target_decode:
+            if num_contexts > 0:
+                prefill_forward(
+                    metadata.plan(self.num_heads,
+                                  self.num_kv_heads,
+                                  self.head_dim,
+                                  q_dtype=q.dtype,
+                                  kv_dtype=kv_cache.dtype,
+                                  q_scaling=self.q_scaling,
+                                  attention_window_size=attention_window_size,
+                                  attention_mask_type=attention_mask_type,
+                                  attention_mask_data=attention_mask_data,
+                                  flashinfer_backend=self.flashinfer_backend),
+                    output[:num_ctx_tokens, :])
+            self._xqa_target_decode(q, kv_cache, metadata, output,
+                                    attention_window_size)
+            return
 
         def decode_forward(plan_params: PlanParams, out: torch.Tensor):
             wrapper = metadata.get_decode_wrapper(plan_params)
@@ -2870,6 +3231,114 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             else:
                 prefill_forward(plan_params, output[:num_ctx_tokens, :])
                 decode_forward(plan_params, output[num_ctx_tokens:, :])
+
+    def _xqa_target_decode(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        metadata: FlashInferAttentionMetadata,
+        output: torch.Tensor,
+        attention_window_size: Optional[int],
+    ) -> None:
+        """Run the target's generation rows with XQA.
+
+        XQA reads per-row KV lengths on the device and needs no plan(). Requests with equal query
+        lengths can run in multi-token mode; otherwise each query token is a q_len-1 row.
+        """
+        if self.has_fp8_kv_cache:
+            raise NotImplementedError(
+                "XQA target verify does not support an FP8 KV cache yet.")
+        # Multi-token mode reads KV once per request: use it on windowless layers. Sliding-window
+        # layers run faster as q_len-1 rows.
+        windowless = attention_window_size is None or attention_window_size < 0
+        block_tables, row_kv_lens, q_len = metadata.get_xqa_target_inputs(
+            self._kv_pool_id(metadata), multi_token=windowless)
+        num_rows = block_tables.size(0)
+        start = metadata.num_ctx_tokens
+        end = start + num_rows * q_len
+        out = output[start:end].view(-1, self.num_heads, self.head_dim)
+        mask = None
+        if q_len > 1:
+            if self.head_dim > 256:
+                _enable_xqa_wide_head_spec_dec()
+            mask = _xqa_chain_mask(metadata.max_num_requests, q_len,
+                                   q.device.index)[:num_rows]
+            # Multi-token mode takes the output as [requests, q_len, heads, head_dim].
+            out = out.view(num_rows, q_len, self.num_heads, self.head_dim)
+        self._run_xqa(q[start:end], kv_cache, metadata, block_tables,
+                      row_kv_lens, out, attention_window_size, q_len, mask)
+
+    def _xqa_shared_kv_draft_decode(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        kv_cache: torch.Tensor,
+        metadata: FlashInferAttentionMetadata,
+        output: torch.Tensor,
+        attention_mask_type: int,
+        attention_mask_data: Optional[torch.Tensor],
+        attention_window_size: Optional[int],
+    ) -> None:
+        """Run a Q-only draft step over the target KV prefix with XQA.
+
+        The shared-KV view keeps the accepted-prefix length of every sequence in
+        ``_draft_kv_runtime_lens`` on the device. XQA reads it there, so the step needs no
+        host plan and stays valid under CUDA graph replay.
+        """
+        if k is not None or v is not None:
+            raise ValueError(
+                "Shared-KV draft attention reads the target KV cache and "
+                "takes no key/value inputs.")
+        if (attention_mask_data is not None
+                or attention_mask_type != int(AttentionMaskType.causal)):
+            raise ValueError(
+                "XQA shared-KV draft attention supports only causal masks.")
+        if metadata.num_contexts != 0:
+            raise RuntimeError("Shared-KV draft views have no context rows.")
+        num_seqs = metadata.num_seqs
+        self._run_xqa(
+            q[:num_seqs], kv_cache, metadata,
+            metadata.get_xqa_draft_block_tables(self._kv_pool_id(metadata)),
+            metadata._draft_kv_runtime_lens[:num_seqs],
+            output[:num_seqs].view(-1, self.num_heads,
+                                   self.head_dim), attention_window_size)
+
+    def _kv_pool_id(self,
+                    metadata: FlashInferAttentionMetadata) -> Optional[int]:
+        """The VSWA KV pool of this layer (None without VSWA)."""
+        layer_to_pool = metadata._vswa_layer_to_pool
+        return (layer_to_pool.get(self.layer_idx)
+                if layer_to_pool is not None else None)
+
+    def _run_xqa(self,
+                 q: torch.Tensor,
+                 kv_cache: torch.Tensor,
+                 metadata: FlashInferAttentionMetadata,
+                 block_tables: torch.Tensor,
+                 seq_lens: torch.Tensor,
+                 out: torch.Tensor,
+                 attention_window_size: Optional[int],
+                 q_len: int = 1,
+                 mask: Optional[torch.Tensor] = None) -> None:
+        """Run XQA over paged KV with device-resident block tables and per-row KV lengths."""
+        q_scaling = self.q_scaling if self.q_scaling is not None else 1.0
+        flashinfer.decode.xqa_batch_decode_with_kv_cache(
+            query=q,
+            kv_cache=kv_cache,
+            workspace_buffer=_get_xqa_workspace(q.device),
+            block_tables=block_tables,
+            seq_lens=seq_lens.view(torch.uint32),
+            max_seq_len=block_tables.size(1) * metadata.page_size,
+            bmm1_scale=1 / (math.sqrt(self.head_dim) * q_scaling),
+            bmm2_scale=1.0,
+            window_left=(attention_window_size
+                         if attention_window_size is not None else -1),
+            out=out,
+            kv_layout=metadata.kv_layout,
+            q_len_per_req=q_len,
+            mask=mask,
+        )
 
     def forward(self,
                 q: torch.Tensor,

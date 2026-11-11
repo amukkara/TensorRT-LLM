@@ -479,6 +479,120 @@ class TestFlashInferAttention(unittest.TestCase):
         finally:
             kv_cache_manager.shutdown()
 
+    # Up to 8 tokens per request (7 drafts + 1 bonus): with 4 query heads per KV head that is
+    # 32 query rows per KV head in multi-token mode.
+    @parameterized.expand([(head_dim, tokens_per_gen) for head_dim in (256, 512)
+                           for tokens_per_gen in (4, 8)])
+    def test_xqa_target_verify_matches_fa2_decode(self, head_dim: int,
+                                                  tokens_per_gen: int):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+        if torch.cuda.get_device_capability()[0] not in (9, 10, 12):
+            self.skipTest("FlashInfer XQA requires SM90, SM100 or SM120")
+
+        num_heads, num_kv_heads = 8, 2
+        num_drafts = tokens_per_gen - 1
+        cached = [40, 75]
+        kv_cache_manager = KVCacheManagerV2(
+            KvCacheConfig(max_tokens=512),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=32,
+            max_seq_len=256,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=tensorrt_llm.bindings.DataType.BF16,
+        )
+        try:
+            kv_cache_manager.add_dummy_requests(
+                [0, 1], [c + tokens_per_gen + num_drafts for c in cached],
+                is_gen=True,
+                max_num_draft_tokens=num_drafts)
+            torch.nn.init.normal_(kv_cache_manager.get_buffers(0))
+            layer = FlashInferAttention(layer_idx=0,
+                                        num_heads=num_heads,
+                                        head_dim=head_dim,
+                                        num_kv_heads=num_kv_heads)
+            num_tokens = 2 * tokens_per_gen
+            q = torch.randn(num_tokens,
+                            num_heads * head_dim,
+                            dtype=torch.bfloat16,
+                            device="cuda")
+            k = torch.randn(num_tokens,
+                            num_kv_heads * head_dim,
+                            dtype=torch.bfloat16,
+                            device="cuda")
+            v = torch.randn_like(k)
+
+            def run(num_cached, full_page_table, offsets=None, metadata=None):
+                kv_cache_params = KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=num_cached,
+                    use_full_generation_page_table=full_page_table,
+                )
+                if metadata is None:
+                    metadata = FlashInferAttentionMetadata(
+                        seq_lens=torch.full((2, ),
+                                            tokens_per_gen,
+                                            dtype=torch.int32),
+                        num_contexts=0,
+                        kv_cache_params=kv_cache_params,
+                        max_num_requests=2,
+                        max_num_tokens=num_tokens,
+                        kv_cache_manager=kv_cache_manager,
+                        request_ids=[0, 1],
+                    )
+                else:
+                    metadata.kv_cache_params = kv_cache_params
+                metadata.prepare()
+                if offsets is not None:
+                    metadata.apply_spec_decode_kv_lens_offsets(
+                        torch.tensor(offsets, dtype=torch.int32, device="cuda"),
+                        num_generations=2,
+                        tokens_per_generation=tokens_per_gen,
+                    )
+                return layer.forward(q, k, v, metadata), metadata
+
+            reference, _ = run(cached, False)
+            exact, metadata = run(cached, True)
+            self.assertIsNotNone(metadata._xqa_target_block_tables)
+            # One q_len-1 row per token, then (equal query lengths) one multi-token row per
+            # request at its full KV length; this windowless layer runs the latter.
+            self.assertEqual(metadata._xqa_target_num_rows, num_tokens)
+            self.assertEqual(metadata._xqa_target_q_len, tokens_per_gen)
+            per_token = [
+                c + 1 + t for c in cached for t in range(tokens_per_gen)
+            ]
+            per_request = [c + tokens_per_gen for c in cached]
+            torch.testing.assert_close(
+                metadata._xqa_target_row_kv_lens[:num_tokens + 2],
+                torch.tensor(per_token + per_request,
+                             dtype=torch.int32,
+                             device="cuda"))
+            torch.testing.assert_close(exact, reference, atol=2e-2, rtol=2e-2)
+
+            # Overlap: the host assumed all drafts of request 0 were accepted; the device
+            # offset rewinds it, so the step appends and attends exactly as the reference. The
+            # first run builds the XQA inputs inside forward, after the offsets; the second
+            # rebuilds them in prepare(), before the offsets.
+            corrected, _ = run([cached[0] + num_drafts, cached[1]], True,
+                               [-num_drafts, 0])
+            torch.testing.assert_close(corrected,
+                                       reference,
+                                       atol=2e-2,
+                                       rtol=2e-2)
+            corrected, _ = run([cached[0] + num_drafts, cached[1]],
+                               True, [-num_drafts, 0],
+                               metadata=metadata)
+            torch.testing.assert_close(corrected,
+                                       reference,
+                                       atol=2e-2,
+                                       rtol=2e-2)
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_separate_kv_draft_metadata_uses_draft_manager(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
