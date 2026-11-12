@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modules.embedding import Embedding
+from tensorrt_llm._torch.modules.embedding import Embedding, embedding_gather
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 
 
@@ -33,6 +33,24 @@ def test_gather_kernel_matches_masked_lookup(hidden, dtype):
 
     assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8))
     assert gather(ids[:, :0]).shape == (2, 0, hidden)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_scaled_gather_matches_lookup_times_scale(dtype):
+    vocab, hidden = 1000, 2560
+    g = torch.Generator(device="cuda").manual_seed(0)
+    weight = torch.randn((vocab, hidden), generator=g, device="cuda").to(dtype)
+    # sqrt(hidden), as Gemma scales its embeddings, held in the table dtype.
+    scale = torch.tensor(hidden**0.5, dtype=dtype)
+    ids = torch.tensor([[0, 1, vocab - 1, 17], [-1, vocab, 5, -1]], device="cuda")
+    in_range = (ids >= 0) & (ids < vocab)
+
+    out = embedding_gather(ids, weight, float(scale))
+    ref = F.embedding(ids.clamp(0, vocab - 1), weight).masked_fill(~in_range.unsqueeze(-1), 0)
+    ref = ref * scale
+
+    assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8))
 
 
 @pytest.mark.cpu_only

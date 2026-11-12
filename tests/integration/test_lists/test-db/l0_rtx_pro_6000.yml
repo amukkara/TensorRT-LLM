@@ -38,6 +38,7 @@ l0_rtx_pro_6000:
   - unittest/_torch/modules/mamba/test_gdn_mixed_decode.py
   - unittest/_torch/attention/test_flashinfer_attention.py # SM120 XQA MTP verify/draft
   - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py # SM120 tile size
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_cublas_mm.py::test_cublas_mm_lm_head # SM120 lm_head algos
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B] # 3mins
