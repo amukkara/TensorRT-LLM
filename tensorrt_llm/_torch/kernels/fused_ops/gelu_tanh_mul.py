@@ -24,6 +24,9 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from ...flashinfer_utils import get_env_enable_pdl
+from ...modules.fla.op import gdc_wait_with_memory_clobber
+
 
 @triton.jit
 def _gelu_tanh_mul_kernel(
@@ -36,7 +39,11 @@ def _gelu_tanh_mul_kernel(
     IDIM: tl.constexpr,
     BM: tl.constexpr,
     BK: tl.constexpr,
+    PDL: tl.constexpr,
 ):
+    if PDL:
+        # Programmatic dependent launch: wait for the producer grid before the first load.
+        gdc_wait_with_memory_clobber()
     rows = tl.program_id(0) * BM + tl.arange(0, BM).to(tl.int64)
     cols = tl.program_id(1) * BK + tl.arange(0, BK)
     mask = (rows < M)[:, None] & (cols < IDIM)[None, :]
@@ -68,6 +75,7 @@ def gelu_tanh_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     # Fixed tiles (no runtime autotune) so launches stay deterministic under CUDA-graph capture.
     bm, bk = 4, 256
     grid = (triton.cdiv(m, bm), triton.cdiv(idim, bk))
+    pdl = get_env_enable_pdl()
     _gelu_tanh_mul_kernel[grid](
         gate,
         up,
@@ -78,6 +86,8 @@ def gelu_tanh_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         IDIM=idim,
         BM=bm,
         BK=bk,
+        PDL=pdl,
         num_warps=4,
+        launch_pdl=pdl,
     )
     return out

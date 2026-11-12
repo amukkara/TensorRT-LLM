@@ -58,6 +58,9 @@ import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version
 
+from ...flashinfer_utils import get_env_enable_pdl
+from ..fla.op import gdc_wait_with_memory_clobber
+
 
 @triton.jit
 def _gemma4_qkv_norm_rope_quant_kernel(
@@ -81,7 +84,11 @@ def _gemma4_qkv_norm_rope_quant_kernel(
     HALF: tl.constexpr,  # HD // 2 (power of two)
     OUT_FP8: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tokens per program (power of two)
+    PDL: tl.constexpr,
 ):
+    if PDL:
+        # Programmatic dependent launch: wait for the producer grid before the first load.
+        gdc_wait_with_memory_clobber()
     h = tl.program_id(0)
     rows = tl.program_id(1).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
     rmask = rows < N
@@ -213,6 +220,7 @@ def gemma4_fused_qkv_norm_rope_quant(
     tile_elems = 2048 if get_sm_version() >= 120 else 4096
     block_n = max(1, min(32, tile_elems // head_dim))
     grid = (num_q_heads + 2 * num_kv_heads, triton.cdiv(n, block_n))
+    pdl = get_env_enable_pdl()
     _gemma4_qkv_norm_rope_quant_kernel[grid](
         qkv,
         q_out,
@@ -234,7 +242,9 @@ def gemma4_fused_qkv_norm_rope_quant(
         HALF=half,
         OUT_FP8=out_fp8,
         BLOCK_N=block_n,
+        PDL=pdl,
         num_warps=8,
+        launch_pdl=pdl,
     )
     if packed_output:
         assert packed_qkv is not None

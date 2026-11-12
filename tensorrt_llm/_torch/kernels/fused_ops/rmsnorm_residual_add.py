@@ -65,6 +65,9 @@ import torch
 import triton
 import triton.language as tl
 
+from ...flashinfer_utils import get_env_enable_pdl
+from ...modules.fla.op import gdc_wait_with_memory_clobber
+
 
 @triton.jit
 def _quant_fp8(v, qs_ptr):
@@ -100,7 +103,11 @@ def _rmsnorm_residual_add_kernel(
     HAS_NORM2: tl.constexpr,
     O_FP8: tl.constexpr,
     N2_FP8: tl.constexpr,
+    PDL: tl.constexpr,
 ):
+    if PDL:
+        # Programmatic dependent launch: wait for the producer grid before the first load.
+        gdc_wait_with_memory_clobber()
     rows = tl.program_id(0) * BM + tl.arange(0, BM).to(tl.int64)
     rmask = rows < M
     cols = tl.arange(0, BH)
@@ -205,6 +212,7 @@ def _launch_norm_add(
     # effective (memory roofline). A block-size/warp sweep confirmed
     # BM=1/num_warps=4 optimal for all three variants.
     grid = (triton.cdiv(m, 1),)
+    pdl = get_env_enable_pdl()
     _rmsnorm_residual_add_kernel[grid](
         x,
         residual if has_residual else x,
@@ -230,7 +238,9 @@ def _launch_norm_add(
         HAS_NORM2=has_norm2,
         O_FP8=out_quant_scale is not None,
         N2_FP8=next_norm_quant_scale is not None,
+        PDL=pdl,
         num_warps=4,
+        launch_pdl=pdl,
     )
     return (o, n2) if has_norm2 else o
 

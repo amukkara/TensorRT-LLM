@@ -24,6 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ...flashinfer_utils import get_env_enable_pdl
+from ...modules.fla.op import gdc_wait_with_memory_clobber
 from .rmsnorm_residual_add import _quant_fp8
 
 
@@ -37,7 +39,11 @@ def _gelu_tanh_mul_fp8_kernel(
     IDIM: tl.constexpr,
     BM: tl.constexpr,
     BK: tl.constexpr,
+    PDL: tl.constexpr,
 ):
+    if PDL:
+        # Programmatic dependent launch: wait for the producer grid before the first load.
+        gdc_wait_with_memory_clobber()
     rows = tl.program_id(0) * BM + tl.arange(0, BM).to(tl.int64)
     cols = tl.program_id(1) * BK + tl.arange(0, BK)
     mask = (rows < M)[:, None] & (cols < IDIM)[None, :]
@@ -76,7 +82,18 @@ def gelu_tanh_mul_fp8_quant(x: torch.Tensor, quant_scale: torch.Tensor) -> torch
     # Fixed tiles: one row and 1024 columns per program.
     bm, bk = 1, 1024
     grid = (triton.cdiv(m, bm), triton.cdiv(idim, bk))
+    pdl = get_env_enable_pdl()
     _gelu_tanh_mul_fp8_kernel[grid](
-        x, out, quant_scale, m, x.stride(0), IDIM=idim, BM=bm, BK=bk, num_warps=4
+        x,
+        out,
+        quant_scale,
+        m,
+        x.stride(0),
+        IDIM=idim,
+        BM=bm,
+        BK=bk,
+        PDL=pdl,
+        num_warps=4,
+        launch_pdl=pdl,
     )
     return out
